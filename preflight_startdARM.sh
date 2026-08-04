@@ -53,5 +53,5 @@ while [ "$attempt" -le "$MAX_RETRIES" ]; do
     sleep "$RETRY_DELAY"
 done
 
-echo "[preflight] Gave up after $MAX_RETRIES attempts - check hardware manually (check_armed.py, ip -details link show can0)."
+echo "[preflight] Gave up after $MAX_RETRIES attempts - check hardware manually (tools/check_armed.py, ip -details link show can0)."
 exit 1
