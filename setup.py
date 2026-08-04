@@ -17,10 +17,13 @@ MOTOR_MAP = {
 }
 
 def main():
+    print("In main()")
     bus = None
     try:
         bus = can.interface.Bus("can0", bustype="socketcan")
+        print("Starting discovery...")
         node_ids = discover_node_ids(bus)
+        print(f"Discovered node ids: {node_ids}")
 
         # Load configuration and endpoints
         config_data = load_configuration()
@@ -28,20 +31,18 @@ def main():
 
         # Iterate through each node
         for node_id in node_ids:
-            # Determine motor type from MOTOR_MAP
             motor_type = MOTOR_MAP.get(node_id)
             if motor_type is None:
                 print(f"[WARNING] No known motor mapping for node {node_id}. Skipping...")
                 continue
 
-            # Log which node is being configured and its motor type
             print(f"Configuring node {node_id} with motor type '{motor_type}'")
 
-            # Apply configuration settings for the mapped motor type
             config_settings = config_data[motor_type]["settings"]
-            if not setup_odrive(bus, node_id, config_settings, endpoints):
-                print("Exiting due to an error in configuring a node.")
-                return
+            ok = setup_odrive(bus, node_id, config_settings, endpoints)
+            if not ok:
+                print(f"[ERROR] Failed configuring node {node_id}; continuing to next.")
+                continue
 
             print()  # For cleaner output
 
@@ -52,6 +53,5 @@ def main():
     finally:
         if bus is not None:
             bus.shutdown()
-
 if __name__ == "__main__":
     main()

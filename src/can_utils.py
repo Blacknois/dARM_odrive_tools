@@ -1,6 +1,12 @@
 import struct
+import threading
 import time
 import can
+
+can_lock = threading.RLock()  # serializes all bus.send/bus.recv across threads
+                              # (main loop, watchdog, metrics/UI thread, and any
+                              # automated sequence) so one thread's response can't
+                              # get stolen by another thread's recv() call.
 
 def extract_node_id(arbitration_id):
     """
@@ -38,7 +44,8 @@ def send_can_message(bus, node_id, command_id, data_format, *data_args):
             data=struct.pack(data_format, *data_args),
             is_extended_id=False,
         )
-        bus.send(message)
+        with can_lock:  # keep this send from landing in the middle of another thread's read
+            bus.send(message, timeout=0.1)  # bounded - a stuck/bus-off TX queue must not hang the caller (this is on the same path as the emergency disarm)
         return True
     except can.CanError:
         return False

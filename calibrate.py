@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 
+import argparse
 import time
 import can
-from src.configure import load_endpoints, read_config
+from src.configure import load_endpoints, read_config, save_config
 from src.control import set_idle_mode
 from src.can_utils import discover_node_ids, send_can_message
 
@@ -19,36 +20,29 @@ ODRIVE_STATES = {
 
 def calibrate_motor(bus, node_id, endpoints):
     """
-    Runs encoder offset calibration for a single motor and waits for it to complete.
+    Runs full calibration for a single motor and waits for it to complete.
     """
     try:
         print(f"Starting calibration for node {node_id}...")
+        send_can_message(bus, node_id, 0x07, '<I', 3)  # Set_Axis_State: FULL_CALIBRATION
 
-        # Send calibration command
-        send_can_message(bus, node_id, 0x07, '<I', 3)  # Command for full calibration
-
-        # Endpoint details for axis0.current_state
         state_endpoint_id = endpoints["endpoints"]["axis0.current_state"]["id"]
         state_endpoint_type = endpoints["endpoints"]["axis0.current_state"]["type"]
 
-        # Wait for the calibration process to complete
         start_time = time.time()
-        timeout = 15  # Allow up to 15 seconds for calibration
+        timeout = 30
 
         while time.time() - start_time < timeout:
-            # Query the current state
             state = read_config(bus, node_id, state_endpoint_id, state_endpoint_type)
-
-            # Map the state to a human-readable description
             state_description = ODRIVE_STATES.get(state, "UNKNOWN")
 
-            if state == 1:  # Referencing "IDLE" state directly from ODRIVE_STATES
+            if state == 1:
                 print(f"Node {node_id} calibration completed successfully.")
                 return True
             else:
                 print(f"[INFO] Node {node_id} is in state {state_description} (State Code: {state}). Waiting...")
 
-            time.sleep(1)  # Poll every second
+            time.sleep(1)
 
         print(f"[ERROR] Node {node_id} did not complete calibration within {timeout} seconds.")
         return False
@@ -56,35 +50,40 @@ def calibrate_motor(bus, node_id, endpoints):
         print(f"[ERROR] Calibration error for node {node_id}: {e}")
         return False
 
-def safe_calibrate_all_motors():
-    """
-    Safely calibrates all motors on the CAN network.
-    """
+def main():
+    parser = argparse.ArgumentParser(description="Calibrate a single ODrive node on the CAN bus.")
+    parser.add_argument("-id", type=int, required=True, help="Node id to calibrate (e.g. -id 7)")
+    args = parser.parse_args()
+
+    bus = None
     try:
-        bus = can.interface.Bus("can0", bustype="socketcan")
+        bus = can.interface.Bus("can0", interface="socketcan")
         print("Discovering ODrives on the CAN network...")
         node_ids = discover_node_ids(bus)
-        print(f"Discovered {len(node_ids)} ODrive(s) on the network:\n")
+        print(f"Discovered {len(node_ids)} ODrive(s): {node_ids}\n")
 
-        # Load endpoints for calibration
+        if args.id not in node_ids:
+            print(f"[ERROR] Node {args.id} not found on the bus. Available nodes: {node_ids}")
+            return
+
         endpoints = load_endpoints()
 
-        for node_id in node_ids:
-            print(f"Preparing to calibrate node {node_id}.")
-            input("Ensure it is safe to proceed with calibration. Press Enter to continue...")
+        print(f"Preparing to calibrate ONLY node {args.id}.")
+        input("Ensure it is safe to proceed with calibration. Press Enter to continue...")
 
-            set_idle_mode(bus, node_id)  # Ensure node is in IDLE mode
-            if calibrate_motor(bus, node_id, endpoints):  # Pass endpoints to calibrate_motor
-                print(f"Node {node_id} successfully calibrated.\n")
-            else:
-                print(f"[ERROR] Calibration failed for node {node_id}. Moving to the next node.\n")
+        set_idle_mode(bus, args.id)
+        if calibrate_motor(bus, args.id, endpoints):
+            save_endpoint_id = endpoints["endpoints"]["save_configuration"]["id"]
+            save_config(bus, args.id, save_endpoint_id)
+            print(f"Node {args.id} successfully calibrated and saved.")
+        else:
+            print(f"[ERROR] Calibration failed for node {args.id}.")
 
-        print("Calibration process completed.")
     except Exception as e:
         print(f"[ERROR] Calibration process encountered an error: {e}")
     finally:
-        if 'bus' in locals() or 'bus' in globals():
+        if bus is not None:
             bus.shutdown()
 
 if __name__ == "__main__":
-    safe_calibrate_all_motors()
+    main()

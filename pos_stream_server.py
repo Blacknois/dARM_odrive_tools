@@ -1,0 +1,121 @@
+"""
+pos_stream_server.py
+
+Read-only companion to watch_limits.py: continuously reads live joint
+positions for all discovered nodes and serves them as JSON over a plain
+local HTTP endpoint, so the darm_visualizer.html page (or anything else
+on the local network) can poll for live positions.
+
+- Does NOT arm, disarm, or send any motion command - reads only.
+- Uses only the Python standard library (http.server, threading, json)
+  plus the project's existing src/configure.py and src/can_utils.py -
+  no new pip installs needed.
+- Safe to run alongside gamecontroller.py in a separate SSH window,
+  same as watch_limits.py.
+- Re-discovers nodes periodically (every REDISCOVER_INTERVAL seconds)
+  rather than once at startup, so a node that wasn't up yet when this
+  server started, or that drops and reconnects (e.g. during a rebuild
+  where nodes get power-cycled), gets picked up automatically instead
+  of silently never appearing/updating again.
+
+Usage (on the Pi, from ~/robot/dARM/odrive_tools/):
+    source .venv/bin/activate
+    python3 pos_stream_server.py
+
+Then from the visualizer page, enter this Pi's address (e.g.
+pidarm:8080 or 192.168.x.x:8080) and click "Connect to live robot".
+
+Find the Pi's local IP if needed with:  hostname -I
+"""
+import json
+import threading
+import time
+import can
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from src.configure import load_endpoints, read_config
+from src.can_utils import discover_node_ids
+
+MAX_PLAUSIBLE_DELTA = 2.0    # ignore single-poll jumps bigger than this (glitch filter)
+POLL_INTERVAL = 0.1          # seconds between CAN reads
+REDISCOVER_INTERVAL = 5.0    # seconds between re-running node discovery
+HTTP_PORT = 8080
+
+latest = {}
+latest_lock = threading.Lock()
+
+
+def poll_loop():
+    bus = can.interface.Bus("can0", interface="socketcan")
+    try:
+        node_ids = sorted(discover_node_ids(bus))
+        endpoints = load_endpoints()["endpoints"]
+        pos_ep = endpoints["axis0.pos_estimate"]
+        last_good = {nid: None for nid in node_ids}
+
+        print(f"pos_stream_server: watching nodes {node_ids}")
+        print(f"pos_stream_server: serving http://0.0.0.0:{HTTP_PORT}/positions")
+        print(f"pos_stream_server: re-discovering nodes every {REDISCOVER_INTERVAL}s")
+        print("Read-only - does not touch arming or motion. Ctrl+C to stop.\n")
+
+        last_rediscover = time.time()
+
+        while True:
+            if time.time() - last_rediscover >= REDISCOVER_INTERVAL:
+                fresh_ids = sorted(discover_node_ids(bus))
+                if fresh_ids != node_ids:
+                    print(f"pos_stream_server: node list changed {node_ids} -> {fresh_ids}")
+                    node_ids = fresh_ids
+                    for nid in node_ids:
+                        if nid not in last_good:
+                            last_good[nid] = None
+                last_rediscover = time.time()
+
+            snapshot = {}
+            for nid in node_ids:
+                pos = read_config(bus, nid, pos_ep["id"], pos_ep["type"])
+                if pos is not None and last_good[nid] is not None:
+                    if abs(pos - last_good[nid]) > MAX_PLAUSIBLE_DELTA:
+                        pos = None  # treat as a glitch, keep the last good value
+                if pos is not None:
+                    last_good[nid] = pos
+                snapshot[str(nid)] = last_good[nid]
+            with latest_lock:
+                latest.clear()
+                latest.update(snapshot)
+                latest["_updated"] = time.time()
+            time.sleep(POLL_INTERVAL)
+    finally:
+        bus.shutdown()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/positions":
+            self.send_response(404)
+            self.end_headers()
+            return
+        with latest_lock:
+            body = json.dumps(latest).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")  # allow the local viewer page to fetch this
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass  # keep the terminal quiet - don't print a line for every poll
+
+
+def main():
+    t = threading.Thread(target=poll_loop, daemon=True)
+    t.start()
+    server = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\npos_stream_server stopped.")
+
+
+if __name__ == "__main__":
+    main()

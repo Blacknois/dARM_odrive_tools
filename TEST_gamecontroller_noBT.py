@@ -211,10 +211,35 @@ def apply_trigger_dead_zone(value):
 def signal_handler(sig, frame):
     raise KeyboardInterrupt
 
-def handle_input(key, loop, node_ids, bus, joint_positions):
+def handle_input(key, loop, node_ids, bus, joint_positions,
+                  endpoints=None, arming_seq=None, safe_return=None,
+                  shoulder_ctrl=None, wrist_ctrl=None):
     if key == 'esc':
         stop_event.set()
         raise urwid.ExitMainLoop()
+    # TEST MODE (noBT) keyboard triggers - call the exact same
+    # underlying safety-critical functions the real Dpad+Circle
+    # gesture and PS-tap use, just triggered by keyboard instead of
+    # a physical controller.
+    if key == ' ':
+        if arming_seq is not None and endpoints is not None and not arming_seq.is_running():
+            print("\n[TEST MODE] SPACEBAR pressed - arming all nodes directly "
+                  "(validate, then arm one at a time, verified)...\n")
+            arming_seq.start(bus, node_ids, endpoints)
+    if key == 'q':
+        if safe_return is not None and endpoints is not None:
+            if safe_return.is_running():
+                safe_return.toggle_pause()
+            else:
+                armed_ep = endpoints['endpoints']['axis0.is_armed']
+                armed_ids = [nid for nid in node_ids
+                             if read_config(bus, nid, armed_ep['id'], armed_ep['type'])]
+                if armed_ids:
+                    print(f"\n[TEST MODE] 'q' PRESSED - starting safe-return sequence "
+                          f"for armed nodes {armed_ids} <<<\n")
+                    safe_return.start(bus, armed_ids, endpoints, shoulder_ctrl, wrist_ctrl, joint_positions)
+                else:
+                    print("[TEST MODE] 'q' pressed but no nodes are armed - nothing to do.")
 
 def clean_shutdown(node_ids, bus, joint_positions, endpoints, safe_return, arming_seq, lockout_event, shoulder_ctrl, wrist_ctrl):
     """
@@ -503,6 +528,10 @@ def run_safe_return_sequence(bus, node_ids, endpoints, shoulder_ctrl, wrist_ctrl
         if pos is None or abs(pos - 0.0) > REST_POS_TOLERANCE:
             already_there = False
             break
+    # TEST MODE (noBT): always run the full staged sequence, even if
+    # already at rest_pos - real gamecontroller.py/run_safe_return_sequence
+    # is unaffected since this is a separate copy of the file.
+    already_there = False
     if already_there:
         print("[SAFE_UP] Already at rest_pos (within tolerance) - skipping safe_up_pos waypoint, disarming directly.")
         failed = []
@@ -1257,6 +1286,22 @@ def main():
     # guarantees nothing can move until you're holding the controller
     # and deliberately choose to arm it.
 
+    # TEST MODE (noBT): no physical joystick/Bluetooth controller is
+    # used. pygame.joystick is monkeypatched globally so every call
+    # site in this file (including the reconnect logic further up in
+    # joystick_thread_func) gets a harmless no-op stick instead of
+    # touching real hardware/Bluetooth.
+    class _NoOpJoystick:
+        def init(self): pass
+        def get_hat(self, idx): return (0, 0)
+        def get_button(self, idx): return False
+        def get_axis(self, idx): return 0.0
+        def get_name(self): return "TEST MODE - no physical joystick (noBT)"
+        def get_numaxes(self): return 6
+
+    pygame.joystick.Joystick = lambda idx: _NoOpJoystick()
+    pygame.joystick.get_count = lambda: 1
+
     pygame.init()
     pygame.joystick.init()
     if pygame.joystick.get_count() == 0:
@@ -1268,6 +1313,7 @@ def main():
     stick.init()
     print(f"Joystick: {stick.get_name()}")
     print(f"# Axes: {stick.get_numaxes()}")
+    print("\n[TEST MODE] SPACEBAR = arm all nodes directly. 'q' = PS-tap (safe-return).\n")
 
     # Shoulder => node1,2
     shoulder_ctrl = None
@@ -1289,10 +1335,10 @@ def main():
     lockout_event = threading.Event()
 
     print("\n" + "="*70)
-    print("About to enter live control. Nodes are NOT armed - nothing can")
-    print("move until you perform Dpad-Left + Circle (held) with the")
-    print("controller in hand. Arming will be refused unless the arm is")
-    print("still at rest_pos.")
+    print("[TEST MODE - NO BLUETOOTH] Nodes are NOT armed - nothing can move")
+    print("until you press SPACEBAR (arms all nodes directly, no hold needed).")
+    print("Press 'q' for PS-tap (safe-return). Arming will be refused unless")
+    print("the arm is still at rest_pos. Press ESC to exit.")
     print("="*70)
     input("Press Enter to continue...")
 
@@ -1308,7 +1354,9 @@ def main():
     loop = urwid.MainLoop(
         frame,
         palette = [('reversed','standout','')],
-        unhandled_input = lambda k: handle_input(k, loop, discovered, bus, joint_positions)
+        unhandled_input = lambda k: handle_input(k, loop, discovered, bus, joint_positions,
+                                                  endpoints, arming_seq, safe_return,
+                                                  shoulder_ctrl, wrist_ctrl)
     )
 
     ui_thread = threading.Thread(

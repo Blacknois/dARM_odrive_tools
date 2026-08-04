@@ -2,7 +2,8 @@
 import json
 import os
 import struct
-from src.can_utils import send_can_message, receive_can_message
+import time
+from src.can_utils import send_can_message, receive_can_message, can_lock
 
 # Constants for ODrive CAN operations
 READ  = 0x00
@@ -38,13 +39,40 @@ def load_endpoints():
 
     return endpoints
 
-def read_config(bus, node_id, endpoint_id, endpoint_type):
-    send_can_message(bus, node_id, RXSDO, '<BHB', READ, endpoint_id, 0)
-    response = receive_can_message(bus, node_id << 5 | TXSDO)
+def read_config(bus, node_id, endpoint_id, endpoint_type, timeout=0.03, retries=3):
+    """
+    Requests an endpoint value and waits for a matching-node response.
+    Drains stale leftover replies before each attempt and retries a few
+    times, since a busy node can occasionally have an old reply sitting
+    in the queue that gets mistaken for the answer to a fresh request.
+    """
+    expected_arb_id = node_id << 5 | TXSDO
+    fmt = '<BHB' + format_lookup[endpoint_type]
+    needed = struct.calcsize(fmt)
 
-    if response:
-        _, _, _, value = struct.unpack_from('<BHB' + format_lookup[endpoint_type], response.data)
-        return value
+    for attempt in range(retries):
+        with can_lock:  # hold the bus for this whole attempt so another thread
+                         # can't send/recv in between and steal our response
+            for _ in range(50):
+                if bus.recv(timeout=0) is None:
+                    break
+
+            send_can_message(bus, node_id, RXSDO, '<BHB', READ, endpoint_id, 0)
+
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                msg = bus.recv(timeout=0)
+                if msg is None:
+                    continue
+                if msg.arbitration_id != expected_arb_id:
+                    continue
+                if len(msg.data) < needed:
+                    continue
+                opcode, reply_endpoint_id, reserved, value = struct.unpack_from(fmt, msg.data)
+                if reply_endpoint_id != endpoint_id:
+                    continue  # stale reply meant for a different endpoint request
+                              # on this same node - not our answer, keep waiting
+                return value
     return None
 
 def write_config(bus, node_id, endpoint_id, endpoint_type, value):
@@ -106,7 +134,7 @@ def clear_errors(bus, node_id, endpoints, clear=True):
                 print(f"Node {node_id} - {error_endpoint} - No error.")
         else:
             print(f"Endpoint {error_endpoint} not found in the provided endpoints.")
-        print()            
+        print()
 
 def set_odrive_parameter(bus, node_id, path, value, endpoints, tolerance=1e-2):
     """
@@ -114,6 +142,14 @@ def set_odrive_parameter(bus, node_id, path, value, endpoints, tolerance=1e-2):
     """
     endpoint_id = endpoints['endpoints'][path]['id']
     endpoint_type = endpoints['endpoints'][path]['type']
+
+    # State-request fields self-clear the instant the ODrive processes them,
+    # so reading them back to "confirm" the write will always look like a
+    # failure even when it worked. Fire the request and move on.
+    if path.endswith('requested_state'):
+        write_config(bus, node_id, endpoint_id, endpoint_type, value)
+        print(f"[INFO] Node {node_id} - {path:50} - State change requested: {value}")
+        return True
 
     current_value = read_config(bus, node_id, endpoint_id, endpoint_type)
     if current_value is None:
@@ -137,7 +173,6 @@ def set_odrive_parameter(bus, node_id, path, value, endpoints, tolerance=1e-2):
 
     print(f"[INFO] Node {node_id} - {path:50} - Updated: {value}")
     return True
-
 
 def setup_odrive(bus, node_id, settings, endpoints):
     """
