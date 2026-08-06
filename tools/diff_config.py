@@ -5,6 +5,8 @@ endpoints) for two nodes and prints only the ones that differ, to find
 whatever is actually different between a node that arms fine (0) and one
 that refuses CLOSED_LOOP_CONTROL (2). Read-only.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import can
 from src.can_utils import discover_node_ids
 from src.configure import load_endpoints, read_config

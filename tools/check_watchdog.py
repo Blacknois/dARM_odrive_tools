@@ -4,6 +4,8 @@ Reads axis0.config.enable_watchdog and axis0.config.watchdog_timeout for
 every discovered node, to compare nodes that armed successfully against
 ones that didn't. Read-only - safe regardless of power/arm status.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import can
 from src.can_utils import discover_node_ids
 from src.configure import load_endpoints, read_config

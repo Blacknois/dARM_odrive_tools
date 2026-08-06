@@ -6,6 +6,8 @@ this), then actively read axis0.pos_estimate via read_config (the same
 path get_metrics() uses) to confirm the underlying value is still live
 and readable. No arming, no motion.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import time
 import can
 from src.configure import load_endpoints, read_config, write_config

@@ -4,6 +4,8 @@ Read-only. Reads axis0.config.watchdog_timeout and axis0.config.enable_watchdog
 for every node, just to see the current baseline before changing anything on
 node 7 specifically. Does not arm or move anything.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import can
 from src.configure import load_endpoints, read_config
 from src.can_utils import discover_node_ids

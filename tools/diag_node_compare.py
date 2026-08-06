@@ -3,6 +3,8 @@
 Read-only diagnostic: compares each node's trap_traj vel/accel/decel limits,
 current/torque limits, and error flags. No writes, no arming, no motion.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import can
 from src.configure import load_endpoints, read_config
 

@@ -5,6 +5,8 @@ on all 8 nodes (RAM only - NOT saved to flash yet). Then actively read
 torque_estimate and vbus_voltage via read_config to confirm the
 underlying values are still live. No arming, no motion.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import time
 import can
 from src.configure import load_endpoints, read_config, write_config

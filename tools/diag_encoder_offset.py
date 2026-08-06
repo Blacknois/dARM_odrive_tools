@@ -5,6 +5,8 @@ current_state, offset, and offset_valid every 50ms, to see exactly what
 happens during just this one sub-step (the full calibration sequence's
 1-second polling may have been too coarse to catch it).
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import time
 import can
 from src.configure import load_endpoints, read_config, save_config

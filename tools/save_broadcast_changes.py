@@ -6,6 +6,8 @@ Nodes stay disarmed throughout - this is a config write only, no
 arming or motion. Each node will briefly reboot to apply+persist the
 save, which is normal ODrive behavior.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import time
 import can
 from src.configure import load_endpoints, read_config, save_config

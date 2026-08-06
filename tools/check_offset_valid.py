@@ -4,6 +4,8 @@ Reads axis0.commutation_mapper.config.offset and offset_valid for every
 discovered node, to check whether offset_valid correlates with which
 nodes armed successfully (0,1,3) vs which didn't (2,4,5,6,7). Read-only.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import can
 from src.can_utils import discover_node_ids
 from src.configure import load_endpoints, read_config

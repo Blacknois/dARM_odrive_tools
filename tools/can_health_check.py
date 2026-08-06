@@ -9,6 +9,8 @@ Usage:
     python3 can_health_check.py 0 1          # test nodes 0 and 1 for 30s
     python3 can_health_check.py 0 1 60       # last arg = duration in seconds
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import sys
 import time
 import can

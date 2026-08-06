@@ -14,6 +14,8 @@ calibration-validity flags (calibration gets redone periodically anyway,
 so a snapshot of it isn't a meaningful drift indicator the way voltage,
 errors, or fault codes are).
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import subprocess
 import time
 import can

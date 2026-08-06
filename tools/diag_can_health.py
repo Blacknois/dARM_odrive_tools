@@ -4,6 +4,8 @@ Read-only CAN health diagnostic: per-node message broadcast rates and
 bus fault counters (n_restarts, error, n_rx, effective baudrate). No
 writes, no arming, no motion.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import can
 from src.configure import load_endpoints, read_config
 

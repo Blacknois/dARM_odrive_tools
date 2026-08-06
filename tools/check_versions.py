@@ -5,6 +5,8 @@ Queries every discovered node's exact firmware/hardware version over CAN
 that armed successfully (0,1,3) against the ones that didn't (2,4,5,6,7).
 Read-only - does not touch axis state, safe regardless of power/arm status.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import struct
 import can
 from src.can_utils import discover_node_ids, send_can_message, receive_can_message

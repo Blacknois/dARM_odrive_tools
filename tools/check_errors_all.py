@@ -4,6 +4,8 @@ Reads active_errors and disarm_reason for every discovered node, to find
 out which nodes faulted (and with what code) during the last console.py
 session. Read-only.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import can
 from src.can_utils import discover_node_ids
 from src.configure import load_endpoints, read_config

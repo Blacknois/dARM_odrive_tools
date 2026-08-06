@@ -5,6 +5,8 @@ verified (write-then-read-back-then-retry) writes. Does not arm or
 move any node - config writes only, RAM only (not saved to flash),
 matching move_to_neutral_slowly()'s original not-persisted design.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import time
 import can
 from src.configure import load_endpoints, read_config, write_config

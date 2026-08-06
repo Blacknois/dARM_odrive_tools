@@ -4,6 +4,8 @@ Immediate, verified disarm: sends IDLE to every node and confirms via
 is_armed read-back, retrying any node that doesn't confirm within a
 few attempts. Prints a clear final status for every node.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import time
 import can
 from src.configure import load_endpoints, read_config

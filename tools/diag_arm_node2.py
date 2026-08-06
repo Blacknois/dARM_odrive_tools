@@ -7,6 +7,8 @@ never leaves IDLE) or briefly accepted and then silently reverted.
 Syncs input_pos to the actual current position first (same as console.py)
 so there is no risk of a startup jump if it does arm.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import time
 import can
 from src.configure import load_endpoints, read_config

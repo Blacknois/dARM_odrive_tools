@@ -6,6 +6,8 @@ support it since nodes are unarmed/no holding torque), and it captures
 the live position automatically at the end of the countdown.
 Read-only - does not arm or move anything.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import time
 import can
 from src.configure import load_endpoints, read_config

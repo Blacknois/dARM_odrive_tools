@@ -3,6 +3,8 @@
 Read-only diagnostic v2: uses real endpoint names for state/errors/current
 limits. No writes, no arming, no motion.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import can
 from src.configure import load_endpoints, read_config
 

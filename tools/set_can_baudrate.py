@@ -25,6 +25,8 @@ Usage:
 Example (test):   python3 set_can_baudrate.py 500000
 Example (revert): python3 set_can_baudrate.py 1000000
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so this can find src/ when run from tools/
 import sys
 import time
 import can
