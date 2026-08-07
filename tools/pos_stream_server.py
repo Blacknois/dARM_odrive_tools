@@ -65,6 +65,9 @@ def poll_loop():
     bus = open_bus()
     node_ids = []
     last_good = {}
+    last_raw = {}  # previous raw reading regardless of accept/reject - used
+                    # to confirm a big jump is real (seen twice in a row)
+                    # rather than a single-poll electrical glitch
     endpoints = load_endpoints()["endpoints"]
     pos_ep = endpoints["axis0.pos_estimate"]
     last_rediscover = 0.0  # force an immediate discovery on first loop pass
@@ -84,6 +87,7 @@ def poll_loop():
                         for nid in node_ids:
                             if nid not in last_good:
                                 last_good[nid] = None
+                                last_raw[nid] = None
                     last_rediscover = time.time()
 
                 snapshot = {}
@@ -91,9 +95,21 @@ def poll_loop():
                     pos = read_config(bus, nid, pos_ep["id"], pos_ep["type"])
                     if pos is not None and last_good[nid] is not None:
                         if abs(pos - last_good[nid]) > MAX_PLAUSIBLE_DELTA:
-                            pos = None  # treat as a glitch, keep the last good value
+                            # Big jump vs. the last accepted value - could be a
+                            # real fast move or a one-off electrical glitch.
+                            # Require it to show up on two consecutive polls
+                            # (close to each other, not just close to the old
+                            # value) before accepting it, so a real move isn't
+                            # rejected forever while a genuine single-sample
+                            # glitch still gets filtered out.
+                            if last_raw[nid] is not None and abs(pos - last_raw[nid]) <= MAX_PLAUSIBLE_DELTA:
+                                pass  # confirmed by the previous poll - accept below
+                            else:
+                                last_raw[nid] = pos
+                                pos = None  # not yet confirmed, keep showing last_good
                     if pos is not None:
                         last_good[nid] = pos
+                        last_raw[nid] = pos
                     snapshot[str(nid)] = last_good[nid]
 
                 with latest_lock:

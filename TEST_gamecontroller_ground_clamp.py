@@ -13,6 +13,7 @@ from src.can_utils import discover_node_ids
 from src.control import move_odrive_to_position, set_closed_loop_control, set_idle_mode
 from src.metrics import get_metrics, METRIC_ENDPOINTS
 from src.configure import load_endpoints, read_config, write_config
+from src.forward_kinematics import check_floor_clamp
 
 # ------------------------------------------------------------------------------
 # Background session logger - purely additive, does not touch any control,
@@ -68,13 +69,13 @@ GRIPPER_SCALING          = 0.5
 #    Node(7)   => Gripper squeeze/release
 # ------------------------------------------------------------------------------
 JOINT0_MIN, JOINT0_MAX = -8.22,  7.91
-JOINT1_MIN, JOINT1_MAX = -5.5,  0.0  # updated 2026-08-06 - measured real weight-contact point at -5.66, 0.16 margin
-JOINT2_MIN, JOINT2_MAX = -8.85,  12.58  # Elbow roll - MIN updated 2026-08-06 (new measured wire limit -8.99, was -10.14 on 2026-07-31 - something physically changed since then, 0.14 margin). MAX still from 2026-07-31 (wire limit 12.72, 0.14 margin).
+JOINT1_MIN, JOINT1_MAX = -5.43,  0.0
+JOINT2_MIN, JOINT2_MAX = -10.00,  12.58  # Elbow roll - measured 2026-07-31 (wire limit -10.14/12.72, 0.14 margin each side)
 JOINT3_MIN, JOINT3_MAX =  0.0,   5.76
 
-BEND_MIN,   BEND_MAX     =  -3.09,  3.09 # Wrist - updated 2026-08-06: real bend scale measured at ~29.1 deg/raw (old 13.75 was ~2x wrong, verified against a real perpendicular-to-forearm landmark), deliberately narrowed to a ±90deg envelope (not the full CAD max) since thats all that is needed right now - expand later if needed. Old value (±8.0, confirmed 2026-07-31 tested throughout no incident) can be revisited then.
-ROTATE_MIN, ROTATE_MAX   = -14.0, 6.5 # Wrist - MIN widened 2026-08-07: real motor-power probe at rest (bend=0) reached -14.7 raw (node5/6) with zero real current draw (ibus flat) - DrJones stopped there deliberately (harness visual check, well short of any resistance, exceeds the ~360deg-total design target), not at a found strain limit. -14.0 keeps a real margin back from the reached point. MAX note (tilt-side asymmetry, needs combined boundary) still applies.
-TRIGGER_MIN, TRIGGER_MAX = -0.9037, 0.032  # MIN measured 2026-08-06 (real full-close pinion limit, no margin - wants full closure); MAX also measured 2026-08-06
+BEND_MIN,   BEND_MAX     =  -8.0,  8.0 # Wrist - confirmed final 2026-07-31 (tested throughout, no incident)
+ROTATE_MIN, ROTATE_MAX   = -15.0, 15.0 # Wrist - confirmed final 2026-07-31 (tested throughout, no incident)
+TRIGGER_MIN, TRIGGER_MAX = -0.85, 0.0  # placeholder range in the NEW reference
                                        # frame (post 2026-07-30 recalibration).
                                        # 0.0 = fully open, confirmed stable and
                                        # repeatable across a power cycle. -0.7
@@ -131,8 +132,8 @@ SAFE_RETURN_DECEL_LIMIT = 0.4
 # authoritative clamp applied in WriteController.apply() - BEND/ROTATE
 # above are only soft bounds on the internal accumulator and are NOT
 # sufficient on their own to guarantee this range.
-MOTOR5_MIN, MOTOR5_MAX = -28.41, 6.8  # MAX raised again 2026-08-07: second motor-power probe same session reached 6.96 (rest, pure rotate) with zero strain - 6.8 keeps margin back from the reached point.
-MOTOR6_MIN, MOTOR6_MAX = -27.36, 6.8  # MAX raised again 2026-08-07: same rest/pure-rotate validated stop as MOTOR5_MAX (node5=node6 at bend=0), reached 6.96
+MOTOR5_MIN, MOTOR5_MAX = -28.41, 6.06
+MOTOR6_MIN, MOTOR6_MAX = -27.36, 4.57
 
 # Soft-limit deceleration: commanded speed scales down within this
 # distance (same units as the joint ranges above) of a min/max limit.
@@ -926,6 +927,7 @@ def joystick_thread_func(
     was_arming_running     = False
     disarm_check_counter  = 0
     watchdog_pending_dropped = set()
+    ground_clamp_was_active = None  # None = not yet evaluated, so first frame always logs its real state
 
     while not stop_event.is_set():
         dt = clock.tick(update_rate) / 1000.0
@@ -1190,29 +1192,13 @@ def joystick_thread_func(
                     wrist_bend_input   = raw_bend 
                     wrist_rotate_input = raw_rotate   
 
-                    # Wrist Envelope: dynamic bend/rotate limits derived from the
-                    # motorA/motorB constraint algebra (motorA=rotate+bend,
-                    # motorB=rotate-bend, each clamped to MOTOR5/6_MIN/MAX), so the
-                    # motor-level clamp can never fire from a single-axis stick input
-                    # alone. Previously, hitting the motor clamp while moving only one
-                    # axis silently dragged the OTHER axis's decomposed value along
-                    # with it (confirmed live: rotating while near BEND_MIN pulled the
-                    # decomposed bend from -2.83 back to -1.25 with zero bend input,
-                    # because node6/motorB froze at its ceiling while node5/motorA kept
-                    # climbing). Cross-terms use the OTHER axis's value from the start
-                    # of this frame (not yet updated), which is close enough at 100Hz.
-                    bend_max_dyn   = min(BEND_MAX,   MOTOR5_MAX - wrist_ctrl.rotate_pos, wrist_ctrl.rotate_pos - MOTOR6_MIN)
-                    bend_min_dyn   = max(BEND_MIN,   MOTOR5_MIN - wrist_ctrl.rotate_pos, wrist_ctrl.rotate_pos - MOTOR6_MAX)
-                    rotate_max_dyn = min(ROTATE_MAX, MOTOR5_MAX - wrist_ctrl.bend_pos,   MOTOR6_MAX + wrist_ctrl.bend_pos)
-                    rotate_min_dyn = max(ROTATE_MIN, MOTOR5_MIN - wrist_ctrl.bend_pos,   MOTOR6_MIN + wrist_ctrl.bend_pos)
+                    new_bend   = wrist_ctrl.bend_pos   + taper_increment(wrist_ctrl.bend_pos, wrist_bend_input * VELOCITY_SCALING * FOREARM_VELOCITY_SCALING * dt, BEND_MIN, BEND_MAX, DECEL_ZONE_WRIST)
+                    new_rotate = wrist_ctrl.rotate_pos + taper_increment(wrist_ctrl.rotate_pos, wrist_rotate_input * VELOCITY_SCALING * FOREARM_VELOCITY_SCALING * dt, ROTATE_MIN, ROTATE_MAX, DECEL_ZONE_WRIST)
 
-                    new_bend   = wrist_ctrl.bend_pos   + taper_increment(wrist_ctrl.bend_pos, wrist_bend_input * VELOCITY_SCALING * FOREARM_VELOCITY_SCALING * dt, bend_min_dyn, bend_max_dyn, DECEL_ZONE_WRIST)
-                    new_rotate = wrist_ctrl.rotate_pos + taper_increment(wrist_ctrl.rotate_pos, wrist_rotate_input * VELOCITY_SCALING * FOREARM_VELOCITY_SCALING * dt, rotate_min_dyn, rotate_max_dyn, DECEL_ZONE_WRIST)
-
-                    if new_bend < bend_min_dyn: new_bend = bend_min_dyn
-                    if new_bend > bend_max_dyn: new_bend = bend_max_dyn
-                    if new_rotate < rotate_min_dyn: new_rotate = rotate_min_dyn
-                    if new_rotate > rotate_max_dyn: new_rotate = rotate_max_dyn
+                    if new_bend < BEND_MIN: new_bend = BEND_MIN
+                    if new_bend > BEND_MAX: new_bend = BEND_MAX
+                    if new_rotate < ROTATE_MIN: new_rotate = ROTATE_MIN
+                    if new_rotate > ROTATE_MAX: new_rotate = ROTATE_MAX
 
                     wrist_ctrl.bend_pos   = new_bend
                     wrist_ctrl.rotate_pos = new_rotate
@@ -1232,6 +1218,45 @@ def joystick_thread_func(
 
                 joint_positions[7] = new_pos
                 move_odrive_to_position(bus, 7, joint_positions[7])
+
+            # --- Ground Clamp: floor-height safety check ---------------------
+            # Runs once per frame, after this frame's per-joint updates have
+            # already been sent (see MODE3_PLAYBACK_DESIGN.md-adjacent design
+            # note: a true pre-send gate would need restructuring the per-joint
+            # inline compute-and-send flow above, which is riskier than this
+            # detect-then-freeze approach - same pattern the watchdog already
+            # uses). The 2cm margin baked into FLOOR_SAFE_Z is sized to absorb
+            # one frame (~10ms) of continued motion at the arm's real speed
+            # limits, so this should never actually let the floor get touched
+            # in practice, even though it's technically "catch fast" rather
+            # than "prevent outright." Read-only computation - does not touch
+            # arming, disarming, or PS-hold, which all live in separate code
+            # paths from this per-joint position block.
+            ground_clamp_ready = bool(shoulder_ctrl and wrist_ctrl and (0 in node_ids) and (3 in node_ids) and (4 in node_ids))
+            if ground_clamp_ready != ground_clamp_was_active:
+                if ground_clamp_ready:
+                    print("[INFO] Ground Clamp: Active (all required nodes present)")
+                else:
+                    print("[INFO] Ground Clamp: Inactive - missing required node(s)/controller for the floor check "
+                          "(needs nodes 0,3,4 plus shoulder_ctrl and wrist_ctrl) - floor is NOT being checked "
+                          "until this resolves.")
+                ground_clamp_was_active = ground_clamp_ready
+
+            if ground_clamp_ready:
+                n5 = wrist_ctrl.rotate_pos + wrist_ctrl.bend_pos
+                n6 = wrist_ctrl.rotate_pos - wrist_ctrl.bend_pos
+                floor_safe, _, floor_violations = check_floor_clamp(
+                    joint_positions[0], shoulder_ctrl.value, joint_positions[3],
+                    joint_positions[4], n5, n6,
+                )
+                if not floor_safe:
+                    lockout_event.set()
+                    print(f"\n[CRITICAL] Ground Clamp: floor-height violation {floor_violations} - "
+                          f"All motion halted - the rest of the arm holds its last position. "
+                          f"Restart gamecontroller.py before continuing.\n")
+                    joystick_states["status"] = (
+                        f"!!! GROUND CLAMP: FLOOR VIOLATION {floor_violations} - ALL MOTION HALTED - RESTART REQUIRED !!!"
+                    )
 
         time.sleep(0.01)
 

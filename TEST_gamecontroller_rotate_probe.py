@@ -29,6 +29,14 @@ def _logging_print(*args, **kwargs):
     _session_log.write(f"[{ts}] {text}\n")
 builtins.print = _logging_print
 # ------------------------------------------------------------------------------
+# Wrist data logger - purely additive, no CAN reads of its own (reuses
+# data already fetched by update_ui_thread's existing get_metrics() call).
+# Does not touch control, arming, or safety logic in any way.
+_wrist_data_log = open("rotate_probe_wrist_data.csv", "a", buffering=1)
+if _wrist_data_log.tell() == 0:
+    _wrist_data_log.write("timestamp,node,pos,amps,bus_amps,tor_Nm,armed,disarm_msg\n")
+# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # 1) Button and Axis Definitions - https://www.pygame.org/docs/ref/joystick.html
 # ------------------------------------------------------------------------------
 DEAD_MAN_BUTTON_INDEX   = 4  # LB
@@ -73,7 +81,7 @@ JOINT2_MIN, JOINT2_MAX = -8.85,  12.58  # Elbow roll - MIN updated 2026-08-06 (n
 JOINT3_MIN, JOINT3_MAX =  0.0,   5.76
 
 BEND_MIN,   BEND_MAX     =  -3.09,  3.09 # Wrist - updated 2026-08-06: real bend scale measured at ~29.1 deg/raw (old 13.75 was ~2x wrong, verified against a real perpendicular-to-forearm landmark), deliberately narrowed to a ±90deg envelope (not the full CAD max) since thats all that is needed right now - expand later if needed. Old value (±8.0, confirmed 2026-07-31 tested throughout no incident) can be revisited then.
-ROTATE_MIN, ROTATE_MAX   = -14.0, 6.5 # Wrist - MIN widened 2026-08-07: real motor-power probe at rest (bend=0) reached -14.7 raw (node5/6) with zero real current draw (ibus flat) - DrJones stopped there deliberately (harness visual check, well short of any resistance, exceeds the ~360deg-total design target), not at a found strain limit. -14.0 keeps a real margin back from the reached point. MAX note (tilt-side asymmetry, needs combined boundary) still applies.
+ROTATE_MIN, ROTATE_MAX   = -16.0, 7.0  # TEST PROBE round 4: -12.0 held with zero real current (ibus flat) - genuinely no strain found yet, widening further. Hand-found unpowered stop was ~-18.2, staying short of that.
 TRIGGER_MIN, TRIGGER_MAX = -0.9037, 0.032  # MIN measured 2026-08-06 (real full-close pinion limit, no margin - wants full closure); MAX also measured 2026-08-06
                                        # frame (post 2026-07-30 recalibration).
                                        # 0.0 = fully open, confirmed stable and
@@ -131,8 +139,8 @@ SAFE_RETURN_DECEL_LIMIT = 0.4
 # authoritative clamp applied in WriteController.apply() - BEND/ROTATE
 # above are only soft bounds on the internal accumulator and are NOT
 # sufficient on their own to guarantee this range.
-MOTOR5_MIN, MOTOR5_MAX = -28.41, 6.8  # MAX raised again 2026-08-07: second motor-power probe same session reached 6.96 (rest, pure rotate) with zero strain - 6.8 keeps margin back from the reached point.
-MOTOR6_MIN, MOTOR6_MAX = -27.36, 6.8  # MAX raised again 2026-08-07: same rest/pure-rotate validated stop as MOTOR5_MAX (node5=node6 at bend=0), reached 6.96
+MOTOR5_MIN, MOTOR5_MAX = -28.41, 8.06  # TEST PROBE: temporarily raised +2.0
+MOTOR6_MIN, MOTOR6_MAX = -27.36, 8.0  # TEST PROBE round 5: widened further for positive-side exploration - 6.37 already reached today with zero strain, giving real headroom past that (was only 0.2 raw / ~5deg before this change)
 
 # Soft-limit deceleration: commanded speed scales down within this
 # distance (same units as the joint ranges above) of a min/max limit.
@@ -852,6 +860,12 @@ def update_ui_thread(bus, node_ids, endpoints, metrics_text, joystick_text, loop
         lines = [header]
         for nid in node_ids:
             data = get_metrics(bus, nid, endpoints)
+            if nid in (5, 6):
+                _wrist_data_log.write(
+                    f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]},{nid},"
+                    f"{data.get('pos')},{data.get('amps')},{data.get('bus_amps')},"
+                    f"{data.get('tor (Nm)')},{data.get('armed')},{data.get('disarm_msg')}\n"
+                )
             row = f"{nid:<{node_col_w}}"
             for metric in METRIC_ENDPOINTS:
                 val = data.get(metric, None)
