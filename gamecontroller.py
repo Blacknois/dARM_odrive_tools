@@ -35,7 +35,12 @@ DEAD_MAN_BUTTON_INDEX   = 4  # LB
 MODE_TOGGLE_BUTTON_INDEX = 5 # RB
 ARM_BUTTON_INDEX        = 1     # Circle
 PS_BUTTON_INDEX         = 10    # PS button
-DPAD_ARM_DIRECTION      = (-1, 0)  # D-pad left
+# Arm gesture used to be D-pad-left + Circle. Switched to L1 + Circle
+# 2026-08-10: DualSense's d-pad has known-flaky hat/button reporting on
+# Linux (real SDL compatibility issue, not a hardware fault - see
+# libsdl-org/SDL#8754), which combined with this gesture's strict
+# same-frame-required hold logic caused unreliable arming. L1 (already
+# DEAD_MAN_BUTTON_INDEX) is a plain button with no such quirk.
 ARM_HOLD_SECONDS        = 1.5
 DISARM_HOLD_SECONDS     = 1.0
 
@@ -161,7 +166,6 @@ stop_event = threading.Event()
 # Joystick states for UI display
 joystick_states = {
     "LB": False,
-    "Dpad": False,
     "Circle": False,
     "PS": False,
     "status": "",
@@ -185,11 +189,22 @@ def apply_dead_zone(value):
     past the dead zone doesn't jump straight to a value of ~DEAD_ZONE -
     previously there was no fine/slow-creep range at all, just a jump
     from 0 to a moderate speed the instant the stick left center.
+
+    Squared (expo) response on top of the rescale, 2026-08-11: small
+    deflections past the dead zone command proportionally less speed
+    than the previous 1:1 linear mapping did (e.g. 30% stick -> ~9%
+    speed instead of 30%), giving finer control for slow/precise moves
+    - full deflection still gives full speed either way. Chosen over
+    shrinking DEAD_ZONE itself, since a smaller dead zone would trade
+    away real noise margin against stall-amplified stick residuals
+    (see the 2026-08-10/11 frame-stall "tell" investigation) - this
+    curve gets the same finer-control result without that tradeoff.
     """
     if abs(value) < DEAD_ZONE:
         return 0.0
     sign = 1.0 if value > 0 else -1.0
-    return sign * (abs(value) - DEAD_ZONE) / (1.0 - DEAD_ZONE)
+    rescaled = (abs(value) - DEAD_ZONE) / (1.0 - DEAD_ZONE)
+    return sign * (rescaled ** 2)
 
 TRIGGER_DEAD_ZONE = 0.05  # small - just enough to ignore rest-position noise
 
@@ -582,8 +597,15 @@ def run_safe_return_sequence(bus, node_ids, endpoints, shoulder_ctrl, wrist_ctrl
             axial_targets[5] = wrist_ctrl.rotate_pos + wrist_ctrl.bend_pos
             axial_targets[6] = wrist_ctrl.rotate_pos - wrist_ctrl.bend_pos
         if axial_targets:
-            wait_for_position(bus, list(axial_targets.keys()), endpoints, axial_targets,
-                               pause_event=pause_event, abort_event=abort_event)
+            axial_done = wait_for_position(bus, list(axial_targets.keys()), endpoints, axial_targets,
+                                            tolerance=0.1, timeout=30.0,
+                                            pause_event=pause_event, abort_event=abort_event)
+            if not axial_done:
+                print("[WARNING] Axial un-spin (base/elbow-roll/wrist-rotate) not "
+                      "confirmed within timeout - NOT proceeding to fold-down. Nodes "
+                      "still ARMED and continuing toward their axial targets. Check "
+                      "manually (check_armed.py) before assuming the sequence finished.")
+                return
 
     if not aborted():
         print("[SAFE_UP] Stage 6: folding down to rest_pos...")
@@ -598,6 +620,7 @@ def run_safe_return_sequence(bus, node_ids, endpoints, shoulder_ctrl, wrist_ctrl
             wrist_ctrl.rotate_pos = 0.0
             wrist_ctrl.apply()
         reached_rest = wait_for_position(bus, node_ids, endpoints, rest_targets,
+                           tolerance=0.1, timeout=30.0,
                            pause_event=pause_event, abort_event=abort_event)
         for nid in node_ids:
             joint_positions[nid] = rest_targets[nid]
@@ -879,10 +902,10 @@ def update_ui_thread(bus, node_ids, endpoints, metrics_text, joystick_text, loop
         for val in axis_values:
             joy_line += f"{val:>6.2f}".ljust(axis_col_w)
 
-        dpad_str = "HELD" if joystick_states["Dpad"] else "-"
+        l1_str = "HELD" if joystick_states["LB"] else "-"
         circle_str = "HELD" if joystick_states["Circle"] else "-"
         ps_str = "HELD" if joystick_states["PS"] else "-"
-        gesture_line = f"DpadLeft:{dpad_str}  Circle:{circle_str}  PS:{ps_str}"
+        gesture_line = f"L1:{l1_str}  Circle:{circle_str}  PS:{ps_str}"
         status_line = f"Status: {joystick_states['status']}"
         joystick_text.set_text(joy_header_line + "\n" + joy_line + "\n\n" + gesture_line + "\n" + status_line)
 
@@ -915,7 +938,7 @@ def joystick_thread_func(
     joystick.init()
     connected = True
 
-    dpad_arm_hold_start   = None
+    arm_hold_start        = None
     arm_triggered_this_hold = False
     awaiting_l1_reset     = False
     l1_released_since_arm = False
@@ -960,7 +983,6 @@ def joystick_thread_func(
         try:
             lb = joystick.get_button(DEAD_MAN_BUTTON_INDEX)
             rb = joystick.get_button(MODE_TOGGLE_BUTTON_INDEX)
-            dpad = joystick.get_hat(0)
             circle = joystick.get_button(ARM_BUTTON_INDEX)
             ps = joystick.get_button(PS_BUTTON_INDEX)
         except pygame.error:
@@ -971,7 +993,6 @@ def joystick_thread_func(
             continue
 
         joystick_states["LB"] = bool(lb)
-        joystick_states["Dpad"] = (dpad == DPAD_ARM_DIRECTION)
         joystick_states["Circle"] = bool(circle)
         joystick_states["PS"] = bool(ps)
 
@@ -994,14 +1015,14 @@ def joystick_thread_func(
         joystick_states["axes"][AXIS_LEFT_TRIGGER]  = raw_lt
         joystick_states["axes"][AXIS_RIGHT_TRIGGER] = raw_rt
 
-        # --- Arm gesture: D-pad left + Circle held 1.5s. Arming itself
+        # --- Arm gesture: L1 + Circle held 1.5s. Arming itself
         # runs on its own thread (ArmingSequence) so this loop is never
         # blocked waiting on it and keeps checking PS-hold every frame no
         # matter how long arming takes.
-        if dpad == DPAD_ARM_DIRECTION and circle and not lockout_event.is_set():
-            if dpad_arm_hold_start is None:
-                dpad_arm_hold_start = time.time()
-            elif (not arm_triggered_this_hold) and (time.time() - dpad_arm_hold_start) >= ARM_HOLD_SECONDS:
+        if lb and circle and not lockout_event.is_set():
+            if arm_hold_start is None:
+                arm_hold_start = time.time()
+            elif (not arm_triggered_this_hold) and (time.time() - arm_hold_start) >= ARM_HOLD_SECONDS:
                 if not arming_seq.is_running():
                     print("\n[INFO] Arm gesture held - arming all nodes in the background "
                           "(validate, then arm one at a time, verified)...\n")
@@ -1009,7 +1030,7 @@ def joystick_thread_func(
                     arming_seq.start(bus, node_ids, endpoints)
                 arm_triggered_this_hold = True
         else:
-            dpad_arm_hold_start = None
+            arm_hold_start = None
             arm_triggered_this_hold = False
 
         # --- Pick up the arming thread's result once it finishes. This
@@ -1163,7 +1184,7 @@ def joystick_thread_func(
 
             # Joint 3 => node4 => Right Stick Y
             if 4 in node_ids:
-                joint_positions[4] += taper_increment(joint_positions[4], -ry * VELOCITY_SCALING * dt, JOINT3_MIN, JOINT3_MAX, DECEL_ZONE)
+                joint_positions[4] += taper_increment(joint_positions[4], ry * VELOCITY_SCALING * dt, JOINT3_MIN, JOINT3_MAX, DECEL_ZONE)
                 if joint_positions[4] < JOINT3_MIN: joint_positions[4] = JOINT3_MIN  
                 if joint_positions[4] > JOINT3_MAX: joint_positions[4] = JOINT3_MAX  
                 move_odrive_to_position(bus, 4, joint_positions[4])  
@@ -1268,7 +1289,7 @@ def main():
         print(f"    Node {nid}: {pos:.4f}")
 
     # No auto-arm here anymore. Nodes stay disarmed until you physically
-    # perform the Dpad-Left + Circle gesture inside the live loop below,
+    # perform the L1 + Circle gesture inside the live loop below,
     # which also gates on the arm actually being at rest_pos - this
     # guarantees nothing can move until you're holding the controller
     # and deliberately choose to arm it.
@@ -1306,7 +1327,7 @@ def main():
 
     print("\n" + "="*70)
     print("About to enter live control. Nodes are NOT armed - nothing can")
-    print("move until you perform Dpad-Left + Circle (held) with the")
+    print("move until you perform L1 + Circle (held) with the")
     print("controller in hand. Arming will be refused unless the arm is")
     print("still at rest_pos.")
     print("="*70)

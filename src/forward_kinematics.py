@@ -50,11 +50,11 @@ SHOULDER_CAD_MAX_DEG = 226.0
 ELBOW_CAD_MAX_DEG = 245.8
 
 # Same calibrated raw<->degree ratios as the visualizer panel defaults.
-SCALE_8308 = 25.9          # base (node0), elbow-roll (node3), deg/raw
+SCALE_8308 = 40.06         # base (node0), elbow-roll (node3), deg/raw - unified value, average of THREE independent powered mark-alignment tests 2026-08-10 (elbow-roll single 360deg: 40.07; elbow-roll +/-360deg two-mark: 40.06; base +/-360deg two-mark: 40.04). Was briefly split into two separate constants mid-session based on an old ~210deg node0 harness-limit reference that turned out to likely be circular (computed from the old 25.9 value, not independently measured) - re-unified once real node0 mark-alignment data confirmed it matches node3 after all, consistent with the two joints genuinely sharing identical parts/gear ratio/motor.
 SCALE_SHOULDER = 41.6       # deg/raw
-SCALE_ELBOW = 37.93         # deg/raw
-SCALE_WRIST_BEND = 13.75    # deg/raw
-SCALE_WRIST_ROTATE = 12.0   # deg/raw
+SCALE_ELBOW = 40.73         # deg/raw (was 37.93, corrected via powered 90deg forearm parallel/perpendicular-to-floor test 2026-08-10)
+SCALE_WRIST_BEND = 29.1     # deg/raw - FIXED 2026-08-09: was still using the stale 13.75 value that gamecontrollers own comment already flagged as ~2x wrong back on 2026-08-06 - never got propagated here, causing finger_tip height to be dramatically overstated for any bent-wrist pose
+SCALE_WRIST_ROTATE = 27.7   # deg/raw (was 12.0, corrected via powered 180deg + 360deg mark-alignment tests 2026-08-10)
 
 
 # --- minimal 3x3 matrix / 3-vector helpers (no numpy) -----------------
@@ -163,10 +163,30 @@ def forward_kinematics(n0, n12, n3, n4, n5, n6):
 # deliberately a rough calibration, not a precision one - the margin
 # below matters far more than nailing the constant to the millimeter.
 FLOOR_Z_BASE_FRAME = 0.004  # meters, real measured floor contact point
-FLOOR_MARGIN = 0.05         # meters, extra buffer above the measured point -
-                             # accounts for real floor unevenness/debris,
-                             # not for FK math uncertainty
-FLOOR_SAFE_Z = FLOOR_Z_BASE_FRAME + FLOOR_MARGIN
+FLOOR_MARGIN_DEFAULT = 0.05  # meters - fallback for any point without a
+                              # real-measurement-backed margin below.
+                              # Accounts for real floor unevenness/debris,
+                              # not for FK math uncertainty.
+
+# Per-point margins (2026-08-09): link_3 and forearm both sit on the
+# same modular gearbox housing shared across nodes 0-4 (confirmed by
+# DrJones - interchangeable layers, identical outer diameter). Real
+# caliper measurement of that housing: 125.79mm max width (across the
+# ridges that hold the assembly bolts, not the smooth valleys between -
+# using the smaller valley measurement would underestimate the real
+# bulge). Using half that (radius, assuming the skeleton line runs
+# through the housing's center) as the real margin for those two points,
+# replacing the old flat 5cm guess with something grounded in a real
+# measurement. differential/gripper/finger_tip are a different,
+# unmeasured component - left at the old default until they get their
+# own real measurement, not changed just because link_3/forearm changed.
+FLOOR_MARGIN_BY_POINT = {
+    "link_3":  0.063,   # 125.79mm housing / 2, real caliper measurement
+    "forearm": 0.063,   # same shared gearbox housing as link_3
+}
+
+def _safe_z_for(name):
+    return FLOOR_Z_BASE_FRAME + FLOOR_MARGIN_BY_POINT.get(name, FLOOR_MARGIN_DEFAULT)
 
 # Which computed points actually get checked against the floor.
 # CORRECTED 2026-08-06: originally excluded link_3/forearm on the
@@ -176,19 +196,28 @@ FLOOR_SAFE_Z = FLOOR_Z_BASE_FRAME + FLOOR_MARGIN
 # link past the shoulder, since any of them can plausibly swing low.
 FLOOR_CHECK_POINTS = ("link_3", "forearm", "differential", "gripper", "finger_tip")
 
+# Kept for anything that still imports a single scalar (e.g. old scripts) -
+# reflects the default/fallback margin, NOT the real per-point values above.
+FLOOR_MARGIN = FLOOR_MARGIN_DEFAULT
+FLOOR_SAFE_Z = FLOOR_Z_BASE_FRAME + FLOOR_MARGIN_DEFAULT
 
-def check_floor_clamp(n0, n12, n3, n4, n5, n6, safe_z=FLOOR_SAFE_Z):
+
+def check_floor_clamp(n0, n12, n3, n4, n5, n6, safe_z=None):
     """
     Returns (is_safe, positions, violations) for the given candidate
     raw node positions. is_safe is False if ANY of FLOOR_CHECK_POINTS
-    would be at or below `safe_z`. violations is a dict of
-    {point_name: z} for just the points that failed, for logging.
+    would be at or below its own real per-point safe_z (see
+    FLOOR_MARGIN_BY_POINT). Passing an explicit `safe_z` overrides this
+    and applies that one flat value to every point instead (kept for
+    backward compatibility / manual what-if checks).
+    violations is a dict of {point_name: z} for just the points that
+    failed, for logging.
     """
     positions = forward_kinematics(n0, n12, n3, n4, n5, n6)
     violations = {
         name: positions[name][2]
         for name in FLOOR_CHECK_POINTS
-        if positions[name][2] <= safe_z
+        if positions[name][2] <= (safe_z if safe_z is not None else _safe_z_for(name))
     }
     return (len(violations) == 0, positions, violations)
 
