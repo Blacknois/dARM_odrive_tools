@@ -101,6 +101,17 @@ controller, and arming is refused unless the arm is physically at
   re-run), `completed_investigations/` (`TEST_`-prefixed scripts from
   finished investigations), `abandoned/` (dead/superseded files).
 
+## Web research standards
+
+When researching hardware/library behavior (e.g. controller/SDL quirks) for
+this project, prefer primary sources - manufacturer docs, or an upstream
+open-source project's own issue tracker/source (e.g. libsdl-org/SDL's own
+issues for an SDL bug) - over third-party blogs/forum posts repeating a
+claim secondhand. Multiple sources only count as real corroboration if
+they're independently reporting the same thing - check whether "multiple
+sources" actually all trace back to one original (possibly wrong) claim
+before treating it as verified.
+
 ## Git workflow note
 
 `origin/main` on GitHub still reflects an older history line (predates

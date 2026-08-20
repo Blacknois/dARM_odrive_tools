@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 
 import time
+import os
 import threading
 import signal
 import urwid
 import pygame
 import can
 import builtins
+import urllib.request
+import json
 from datetime import datetime
 
 from src.can_utils import discover_node_ids
@@ -44,6 +47,259 @@ PS_BUTTON_INDEX         = 10    # PS button
 ARM_HOLD_SECONDS        = 1.5
 DISARM_HOLD_SECONDS     = 1.0
 
+# IK-mode trigger (2026-08-13, first version). Triangle - unused by
+# anything else (RB is already wrist_mode, L1+Circle is arming).
+# Drives base/shoulder/elbow-roll/elbow toward a solved target using
+# the SAME taper_increment() safety logic as manual moves - not new
+# motion math, just a different source of "which way to move".
+# Deliberately excludes wrist (bend/rotate) - that joint's dynamic
+# envelope math (limits that depend on the OTHER axis's live value)
+# needs its own careful integration, not done yet. Also excludes
+# gripper - IK solves for reaching a point, not for grasping, so
+# there is no gripper target to drive toward here.
+# ANY manual stick input immediately cancels IK-mode back to the
+# human - it never fights a human input.
+IK_TRIGGER_BUTTON_INDEX = 2  # Triangle - empirically confirmed 2026-08-13 via
+                             # button_finder.py, NOT 3 as standard PS-controller
+                             # ordering would suggest. This DualSense/SDL/Linux
+                             # setup has already proven not to reliably follow
+                             # standard button ordering (see the d-pad SDL
+                             # compatibility issue that moved the arm gesture
+                             # off the d-pad originally) - don't assume, verify.
+IK_HOLD_SECONDS         = 1.5
+IK_VELOCITY_SCALING     = 0.45  # 2026-08-13: was 0.6, lowered further per DrJones's
+                                 # own report ("still about the fastest I drive it") -
+                                 # his manual driving already runs through the
+                                 # squared/expo dead-zone curve below, so his typical
+                                 # EFFECTIVE speed at his usual 30-70% stick travel is
+                                 # often well under even this. This is the flat ceiling
+                                 # the ramp-up below builds toward, not commanded
+                                 # instantly - see IK_RAMP_UP_SECONDS.
+IK_RAMP_UP_SECONDS      = 1.5  # 2026-08-13: real first-test finding - moving all 4
+                                # IK-controlled joints simultaneously from a standing
+                                # start produced audible creaking/cracking (DrJones's
+                                # own report) - a plausible real contributor is
+                                # commanding near-full speed on all 4 joints at once
+                                # with no ramp, unlike manual driving's stick-travel-
+                                # based easing. Smoothly ramps commanded speed from 0
+                                # to IK_VELOCITY_SCALING over this many seconds from
+                                # trigger, synchronized across all 4 joints (all
+                                # reference the same ik_start_time, so none jerks
+                                # ahead of the others).
+TARGET_ARRIVAL_DECEL_ZONE = 0.8  # 2026-08-17: programmed moves (Triangle AND the pick/
+                                  # place buttons) were reaching cruising speed only once
+                                  # within 1.0 raw units of target (the implicit clamp in
+                                  # max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE))), then decelerating
+                                  # proportionally the entire rest of the way - for
+                                  # smaller-range joints (shoulder span 5.5, elbow span
+                                  # 6.05) that's ~20% of the whole joint spent decelerating,
+                                  # not just a final approach. Dividing diff by this before
+                                  # clamping reaches full speed sooner (once remaining
+                                  # distance >= 0.8) and narrows the decel window - global
+                                  # for now (same for every joint), not yet per-joint like
+                                  # the existing DECEL_ZONE*/DECEL_ZONE_WRIST_*/
+                                  # DECEL_ZONE_GRIPPER constants are for limit-deceleration.
+IK_ARRIVAL_TOLERANCE    = 0.08  # same units as joint_positions/shoulder_ctrl.value.
+                                 # History: started 0.05 (too close to documented real
+                                 # per-event creep of ~0.025-0.074, risked chatter) ->
+                                 # widened to 0.15 -> confirmed working on a real
+                                 # successful run 2026-08-13 -> tightened here to 0.08,
+                                 # still safely above the noise floor but closer than
+                                 # 0.15's margin, per DrJones's own call while testing live.
+IK_SERVICE_URL          = "http://192.168.1.119:8901/solve"
+# Overall hard timeout - covers BOTH failure modes with one backstop: a
+# target that's valid per the IK service's own bounds check but not
+# actually reachable within this script's real hand-measured limits
+# (two independently-maintained limit systems, never cross-validated),
+# and a settle-check that never passes. Either way, give up cleanly by
+# this point rather than running indefinitely.
+IK_TIMEOUT_SECONDS      = 20.0
+# Settle-check: once the COMMANDED trajectory reaches target, wait this
+# long, then do ONE real live-position read (not a repeating correction
+# loop - see design discussion 2026-08-13) against a WIDER tolerance
+# that accounts for real mechanical flex/backlash, not just encoder
+# noise. Never issues a fresh movement command based on this check -
+# only confirms-or-relies-on-the-overall-timeout-above.
+IK_SETTLE_WAIT_SECONDS  = 0.5
+IK_SETTLE_TOLERANCE     = 0.3
+# Catalogued targets are real values already proven reachable (captured
+# live via calibrate_board.py), not a solver's estimate - so they can be
+# held to a much tighter arrival/settle check than a live-solved target.
+# 2026-08-17: found live that catalogue replays approaching from a
+# different direction than the original capture landed up to half a
+# square off, worse (and higher above the board) approaching from the
+# right - the shared 0.08/0.3 IK tolerances were letting the move stop
+# well short. Reusing GRIP_ARRIVAL_TOLERANCE/GRIP_SETTLE_TOLERANCE's
+# already-proven values rather than inventing new ones.
+CATALOGUE_ARRIVAL_TOLERANCE = 0.02
+CATALOGUE_SETTLE_TOLERANCE  = 0.05
+# First-version target is hardcoded - no camera/sensor integration
+# exists yet to provide a real one. Same target already validated
+# end-to-end today (manual math + a real robot test).
+IK_TEST_TARGET_XYZ      = (0.4, 0.2, 0.3)
+# External chess-controller integration (2026-08-15): if this file
+# exists and parses, its x/y/z override IK_TEST_TARGET_XYZ for the next
+# Triangle-triggered IK request - written by set_ik_target.py, a
+# separate tool outside the live control path. Falls back to the
+# hardcoded default on ANY problem (missing file, bad JSON, missing
+# keys) - a stale/bad file can never crash this loop or silently do
+# something unexpected, it just behaves exactly as before this change.
+IK_TARGET_FILE = os.path.expanduser('~/dARM/odrive_tools/ik_target.json')
+
+def read_ik_target():
+    try:
+        with open(IK_TARGET_FILE) as f:
+            data = json.load(f)
+        grip = None
+        if 'grip' in data:
+            try:
+                grip = float(data['grip'])
+            except Exception:
+                grip = None
+        return (float(data['x']), float(data['y']), float(data['z']), grip)
+    except Exception:
+        return (*IK_TEST_TARGET_XYZ, None)
+
+
+# Real captured powered positions (2026-08-17) - see calibrate_board.py.
+# For a catalogued square, Triangle drives DIRECTLY to the exact raw
+# joint values that were actually captured getting there live, no
+# live-solve at all - skips the whole real-world accuracy problem for
+# these specific squares entirely, since it's not predicting/computing
+# anything, just replaying a real measured result. Falls back to the
+# normal live-solve path (unchanged) for any square not yet catalogued.
+CATALOGUE_FILE = os.path.expanduser('~/dARM/odrive_tools/chess_catalogue.json')
+CATALOGUE_REPLAY_LOG_FILE = os.path.expanduser('~/dARM/odrive_tools/chess_catalogue_replay_log.jsonl')
+
+
+def read_catalogue_target():
+    try:
+        with open(IK_TARGET_FILE) as f:
+            data = json.load(f)
+        sq = str(data.get('square', '')).strip().lower()
+        if not sq:
+            return None
+        with open(CATALOGUE_FILE) as f:
+            catalogue = json.load(f)
+        entry = catalogue['squares'][sq]['raw_nodes']
+        return {0: entry['node0'], 1: entry['node1'], 3: entry['node3'],
+                4: entry['node4'], 5: entry['node5'], 6: entry['node6']}
+    except Exception:
+        return None
+
+# --- Pick/Place buttons (2026-08-17, corrected design) ---
+# Square and Cross (X) - empirically confirmed via button_finder.py on
+# 2026-08-17, NOT the standard-ordering-expected indices (same caution
+# as Triangle above - this DualSense/SDL setup has repeatedly proven not
+# to follow standard ordering, see the SDL#8754 issue referenced in the
+# d-pad comment elsewhere in this file).
+PICK_BUTTON_INDEX  = 3  # Square
+PLACE_BUTTON_INDEX = 0  # Cross (X)
+PICK_PLACE_HOLD_SECONDS = 0.5
+# Reuse the same proven tolerances/timings as IK-mode rather than
+# inventing new ones.
+SEQUENCE_ARRIVAL_TOLERANCE  = IK_ARRIVAL_TOLERANCE
+SEQUENCE_SETTLE_WAIT_SECONDS = IK_SETTLE_WAIT_SECONDS
+SEQUENCE_SETTLE_TOLERANCE   = IK_SETTLE_TOLERANCE
+SEQUENCE_WP_TIMEOUT_SECONDS = 30.0  # per-waypoint backstop, not per-sequence.
+                                     # Widened 2026-08-17 from 15.0 - real evidence the old
+                                     # value was cutting the grip step off before it finished:
+                                     # closing near TRIGGER_MIN is deliberately slow (the same
+                                     # decel-zone safety taper used everywhere else), and a firm
+                                     # grip needs more time than 15s to actually get there.
+# Gripper needs a much tighter arrival check than the arm joints - real
+# bug found 2026-08-17 live: the shared 0.08 tolerance let the grip step
+# declare "arrived" as soon as it got within 0.08 of the -0.85 target
+# (i.e. anywhere past -0.77), which is nowhere near firm enough to
+# actually hold a piece - confirmed live ("didn't quite pick it up").
+GRIP_ARRIVAL_TOLERANCE = 0.02
+GRIP_SETTLE_TOLERANCE  = 0.05
+
+# Real design intent (corrected 2026-08-17 after first version wrongly
+# jumped to an absolute pre-solved square position and produced a big
+# unexpected whole-arm sweep): Triangle already gets the arm TO a target
+# via a live solve - Square/Cross do NOT repeat that. They perform a
+# standard, repeatable LOCAL descend/grip/lift starting from wherever
+# the arm already is the moment the button is pressed. "How far down is
+# down" can't be a fixed raw-joint number (needs coordinated multi-joint
+# movement that depends on the arm's current pose), so this fixed delta
+# was derived ONCE (not solved live) by averaging the real hover->descend
+# offset across several known-good, low-error solved squares near the
+# board's working area (d2/d4/e4/d3/e3/c3/f3) - see session notes. This
+# is an approximation, not exact for every possible arm pose, but the
+# spread across those squares was small, so it should be close enough
+# across the actual working region above the board.
+PICK_PLACE_DESCEND_DELTA = {
+    0: 0.0376, 1: -0.0475, 3: 0.0, 4: -0.1245, 5: 0.2422, 6: -0.2421,
+}
+PICK_PLACE_GRIP_DEFAULT = -0.85  # tightened 2026-08-17 after live test - old -0.565 (chess_move_
+                                  # sequencer.py's default) was too wide to actually hold the piece,
+                                  # confirmed live ("would have worked if it closed farther").
+                                  # Close to TRIGGER_MIN (-0.9037, the real full-close pinion limit)
+                                  # with a small safety margin.
+PICK_PLACE_RELEASE_VALUE = -0.65  # tightened 2026-08-17 - the new compliant chess_spring fingers
+                                  # don't need to go to GRIPPER_RELEASE_OPEN (0.0, fully open) to
+                                  # actually let go of a piece, per live confirmation.
+
+
+def read_pick_place_grip():
+    """Reads the closed-grip value from ik_target.json's 'grip' field (the
+    SAME file Triangle/set_ik_target.py/chess_move_sequencer.py already
+    write) - falls back to PICK_PLACE_GRIP_DEFAULT on any problem, same
+    defensive pattern as read_ik_target()."""
+    try:
+        with open(IK_TARGET_FILE) as f:
+            data = json.load(f)
+        if data.get('grip') is not None:
+            return float(data['grip'])
+    except Exception:
+        pass
+    return PICK_PLACE_GRIP_DEFAULT
+
+
+def current_raw_nodes(joint_positions, shoulder_ctrl, wrist_ctrl):
+    """Snapshots the arm's actual current commanded position as a
+    raw-node dict, in the same shape/units as the pre-solved lookup
+    table entries - this is the reference 'hover' point pick/place
+    build off of, captured fresh at the moment the button is pressed."""
+    bend = wrist_ctrl.bend_pos if wrist_ctrl else 0.0
+    rotate = wrist_ctrl.rotate_pos if wrist_ctrl else 0.0
+    return {
+        0: joint_positions[0],
+        1: shoulder_ctrl.value if shoulder_ctrl else 0.0,
+        3: joint_positions[3],
+        4: joint_positions[4],
+        5: bend + rotate,   # inverse of bend=(n5-n6)/2, rotate=(n5+n6)/2
+        6: rotate - bend,
+    }
+
+
+def build_pick_waypoints(current_raw, grip_closed):
+    """Standard repeatable pick pattern (hover -> descend -> grip -> lift),
+    RELATIVE to wherever the arm currently is - hover IS the current
+    position, descend is current + PICK_PLACE_DESCEND_DELTA."""
+    hover = dict(current_raw)
+    descend = {k: current_raw[k] + PICK_PLACE_DESCEND_DELTA[k] for k in current_raw}
+    return [
+        (hover,   PICK_PLACE_RELEASE_VALUE, "hover (current position)"),
+        (descend, PICK_PLACE_RELEASE_VALUE, "descend"),
+        (descend, grip_closed,              "grip"),
+        (hover,   grip_closed,              "lift"),
+    ]
+
+
+def build_place_waypoints(current_raw, grip_closed):
+    """Standard repeatable place pattern (hover -> descend -> release ->
+    lift), same relative-to-current-position basis as build_pick_waypoints()."""
+    hover = dict(current_raw)
+    descend = {k: current_raw[k] + PICK_PLACE_DESCEND_DELTA[k] for k in current_raw}
+    return [
+        (hover,   grip_closed,              "hover (current position)"),
+        (descend, grip_closed,              "descend"),
+        (descend, PICK_PLACE_RELEASE_VALUE, "release"),
+        (hover,   PICK_PLACE_RELEASE_VALUE, "lift"),
+    ]
+
 AXIS_LEFT_X       = 0  # Left stick horizontal
 AXIS_LEFT_Y       = 1  # Left stick vertical
 AXIS_LEFT_TRIGGER = 2  # L2 (physical left trigger)  
@@ -60,8 +316,13 @@ DEAD_ZONE                = 0.25
 VELOCITY_SCALING         = 1.35  # was 1.5 - 10% across-the-board reduction,
                                         # structure was flexing noticeably at the
                                         # old speed
+SHOULDER_VELOCITY_SCALING = 1.2825  # 2026-08-17: shoulder (nodes 1,2) only, a
+                                     # further 5% below the shared VELOCITY_SCALING -
+                                     # felt violent at full extension. Base rotation
+                                     # (node0) intentionally unaffected - still uses
+                                     # VELOCITY_SCALING directly.
 FOREARM_VELOCITY_SCALING = 1.8   # was 2.0 - same 10% reduction
-GRIPPER_SCALING          = 0.5
+GRIPPER_SCALING          = 0.75  # 2026-08-17: was 0.5, raised for a faster manual grip
 
 # ------------------------------------------------------------------------------
 # 2) Joint Range Definitions
@@ -75,9 +336,21 @@ GRIPPER_SCALING          = 0.5
 JOINT0_MIN, JOINT0_MAX = -8.22,  7.91
 JOINT1_MIN, JOINT1_MAX = -5.5,  0.0  # updated 2026-08-06 - measured real weight-contact point at -5.66, 0.16 margin
 JOINT2_MIN, JOINT2_MAX = -8.85,  12.58  # Elbow roll - MIN updated 2026-08-06 (new measured wire limit -8.99, was -10.14 on 2026-07-31 - something physically changed since then, 0.14 margin). MAX still from 2026-07-31 (wire limit 12.72, 0.14 margin).
-JOINT3_MIN, JOINT3_MAX =  0.0,   5.76
+JOINT3_MIN, JOINT3_MAX =  0.0,   6.05  # MAX updated 2026-08-15 - real measured hard stop ~6.12-6.15 raw (two independent disarmed hand-tested marks), 6.05 leaves a real margin back from it. MIN unchanged - confirmed 2026-08-15 as a genuine hard stop already at its true limit, no room to extend.
 
-BEND_MIN,   BEND_MAX     =  -3.09,  3.09 # Wrist - updated 2026-08-06: real bend scale measured at ~29.1 deg/raw (old 13.75 was ~2x wrong, verified against a real perpendicular-to-forearm landmark), deliberately narrowed to a ±90deg envelope (not the full CAD max) since thats all that is needed right now - expand later if needed. Old value (±8.0, confirmed 2026-07-31 tested throughout no incident) can be revisited then.
+BEND_MIN,   BEND_MAX     =  -3.7113,  3.7113 # Wrist - widened 2026-08-17 from +/-90deg to +/-108deg
+                             # (3.7113 raw = 108deg at the 29.1 deg/raw scale). Reason: real
+                             # touch-off at a8 hit the old +/-90deg limit before the fingers were
+                             # perpendicular to the board - needed more bend range for that reach.
+                             # Checked against real contact data first (live raw readout showing
+                             # bend~130deg + rotate~41deg together at first contact, matching the
+                             # documented CAD +/-110deg figure) - 108deg stays a couple degrees under
+                             # that, so this alone should not reach contact. IMPORTANT: contact was
+                             # only observed with bend AND rotate pushed together (matches the known
+                             # swashplate-coupled wrist mechanism, see CLAUDE.md Known open issues
+                             # section) - this widening does not by itself guarantee safety at high
+                             # bend combined with high rotate simultaneously, that combined boundary
+                             # is still uncharacterized. ROTATE_MIN/MAX unchanged by this edit.
 ROTATE_MIN, ROTATE_MAX   = -14.0, 6.5 # Wrist - MIN widened 2026-08-07: real motor-power probe at rest (bend=0) reached -14.7 raw (node5/6) with zero real current draw (ibus flat) - DrJones stopped there deliberately (harness visual check, well short of any resistance, exceeds the ~360deg-total design target), not at a found strain limit. -14.0 keeps a real margin back from the reached point. MAX note (tilt-side asymmetry, needs combined boundary) still applies.
 TRIGGER_MIN, TRIGGER_MAX = -0.9037, 0.032  # MIN measured 2026-08-06 (real full-close pinion limit, no margin - wants full closure); MAX also measured 2026-08-06
                                        # frame (post 2026-07-30 recalibration).
@@ -106,6 +379,24 @@ SAFE_UP_ELBOW_POS      = 3.029    # node 4
 SAFE_UP_WRIST_BEND     = -0.0353  # WriteController.bend_pos; rotate_pos is left
                                     # alone at this stage and zeroed later in the
                                     # axial un-spin stage
+# Catalogue staging waypoint (2026-08-17): always routing through one
+# fixed, known pose before the final approach fixes direction-dependent
+# backlash (approaching a catalogued square from a different side than
+# it was captured from landed up to half a square off) - the final
+# short leg into every catalogued target now always arrives from the
+# same direction, regardless of where the arm started. Confirmed
+# working live with safe_up_pos as the staging point (a7, d4 both
+# landed correctly). Replaced here with a purpose-captured pose
+# ("stage pos chess 2" in Carla's recording tool, 2026-08-17) - less
+# looming than safe_up_pos's full vertical extension, wrist picked
+# nearly straight rather than sharply folded specifically so it won't
+# hit the board/pieces if it drifts, while still clearing piece height
+# on the way in (manually posed and captured live, same method as
+# safe_up_pos originally was - not derived through any FK chain).
+CATALOGUE_STAGING_TARGET = {
+    0: -3.128562, 1: -4.275810, 3: 0.0,
+    4: 5.663924, 5: 0.421712, 6: -0.405434,
+}
 GRIPPER_RELEASE_OPEN   = 0.0       # Fully open in the NEW reference frame
                                     # (2026-07-30, after the encoder mount was
                                     # fixed and recalibrated). The old value of
@@ -142,8 +433,10 @@ MOTOR6_MIN, MOTOR6_MAX = -27.36, 6.8  # MAX raised again 2026-08-07: same rest/p
 # Soft-limit deceleration: commanded speed scales down within this
 # distance (same units as the joint ranges above) of a min/max limit.
 DECEL_ZONE         = 1.0
-DECEL_ZONE_WRIST   = 3.0
-DECEL_ZONE_GRIPPER = 0.2
+DECEL_ZONE_WRIST_BEND   = 0.45  # 2026-08-16: shrunk (not removed) per explicit request - keeps a real, if tighter, glide-to-stop instead of zeroing it out entirely. Roughly half the previous 0.93 (15% of span). Global ik_speed cap + the separate hard Wrist Envelope position clamp (bend_min_dyn/bend_max_dyn) both still fully in effect regardless.
+DECEL_ZONE_WRIST_ROTATE = 1.5   # 2026-08-16: same reasoning as bend above. Roughly half the previous 3.08 (15% of span).
+MIN_WRIST_IK_STEP = 0.01  # 2026-08-16: real live-observed bug - on an IK-mode retry with a small remaining diff, `step = diff * ik_speed * dt` shrinks proportionally with no floor, and got small enough that the wrist barely moved at all (suspected: too small to reliably overcome real motor cogging/static friction). This floors the wrist's commanded step magnitude (never the direction/sign) so a retry always produces a command big enough to actually move the motor. Deliberately kept smaller than IK_ARRIVAL_TOLERANCE (0.08) to avoid overshoot. Wrist-only - node0/3/4's step formulas are untouched.
+DECEL_ZONE_GRIPPER = 0.08  # 2026-08-17: was 0.2, compressed - more of the range at full speed
 
 def taper_increment(current_val, increment, min_val, max_val, decel_zone):
     """
@@ -161,12 +454,31 @@ def taper_increment(current_val, increment, min_val, max_val, decel_zone):
         increment *= scale
     return increment
 
+def ik_request_worker(x, y, z, result_holder):
+    """
+    Runs the network call to redPi's IK solver service on its OWN
+    thread, so it can never block the main control loop - in
+    particular, never blocks PS-hold responsiveness. Same reasoning as
+    ArmingSequence already running on its own thread for its own
+    multi-step operation. Writes into result_holder (a plain dict) so
+    the main loop can poll it without blocking - never touches CAN,
+    the bus, or anything safety-related itself.
+    """
+    try:
+        url = f"{IK_SERVICE_URL}?x={x}&y={y}&z={z}"
+        with urllib.request.urlopen(url, timeout=2.0) as resp:
+            result_holder['solve'] = json.loads(resp.read())
+    except Exception as e:
+        result_holder['error'] = str(e)
+    result_holder['done'] = True
+
 stop_event = threading.Event()
 
 # Joystick states for UI display
 joystick_states = {
     "LB": False,
     "Circle": False,
+    "Triangle": False,
     "PS": False,
     "status": "",
     "axes": {
@@ -905,7 +1217,8 @@ def update_ui_thread(bus, node_ids, endpoints, metrics_text, joystick_text, loop
         l1_str = "HELD" if joystick_states["LB"] else "-"
         circle_str = "HELD" if joystick_states["Circle"] else "-"
         ps_str = "HELD" if joystick_states["PS"] else "-"
-        gesture_line = f"L1:{l1_str}  Circle:{circle_str}  PS:{ps_str}"
+        triangle_str = "HELD" if joystick_states["Triangle"] else "-"
+        gesture_line = f"L1:{l1_str}  Circle:{circle_str}  PS:{ps_str}  Triangle(IK):{triangle_str}"
         status_line = f"Status: {joystick_states['status']}"
         joystick_text.set_text(joy_header_line + "\n" + joy_line + "\n\n" + gesture_line + "\n" + status_line)
 
@@ -942,6 +1255,18 @@ def joystick_thread_func(
     arm_triggered_this_hold = False
     awaiting_l1_reset     = False
     l1_released_since_arm = False
+    wrist_mode_prev        = False
+    awaiting_stick_neutral = False
+    pick_hold_start        = None
+    place_hold_start       = None
+    sequence_active        = False
+    sequence_kind          = None
+    sequence_square        = None
+    sequence_waypoints     = None
+    sequence_index         = 0
+    sequence_start_time    = None
+    sequence_wp_reached_time = None
+    sequence_button_released_since_start = False
     ps_prev               = False
     ps_press_time         = None
     all_armed             = False
@@ -949,6 +1274,28 @@ def joystick_thread_func(
     was_arming_running     = False
     disarm_check_counter  = 0
     watchdog_pending_dropped = set()
+
+    ik_hold_start   = None
+    ik_mode_active  = False
+    ik_mode_is_catalogued = False  # True only while driving to a catalogued
+                                    # (real captured) target - see
+                                    # CATALOGUE_ARRIVAL_TOLERANCE below.
+    ik_catalogue_staging = False   # True only during the first (staging) leg
+                                    # of a catalogued move - see
+                                    # CATALOGUE_STAGING_TARGET above.
+    ik_catalogue_final_target = None  # holds the real catalogued target while
+                                       # ik_targets points at the staging pose
+    ik_catalogue_square_name = None   # which square, for replay-accuracy logging only
+    ik_catalogue_settle_snapshot = {}  # {node_id: (target, live)}, captured during
+                                        # the settle-check below, logged once settled
+    ik_targets      = None
+    ik_pending_grip = None  # optional node7 target, carried from trigger to ik_targets construction
+    ik_triangle_released_since_start = False
+    ik_start_time             = None  # overall timeout clock, set at trigger
+    ik_commanded_reached_time = None  # set once the commanded trajectory first reaches target
+    ik_request_thread = None  # holds the in-flight background request thread, if any
+    ik_request_result = {}    # written by ik_request_worker, polled here - never blocks
+    ik_last_debug_print = 0.0  # throttles the diagnostic print below to ~2x/sec
 
     while not stop_event.is_set():
         dt = clock.tick(update_rate) / 1000.0
@@ -985,6 +1332,9 @@ def joystick_thread_func(
             rb = joystick.get_button(MODE_TOGGLE_BUTTON_INDEX)
             circle = joystick.get_button(ARM_BUTTON_INDEX)
             ps = joystick.get_button(PS_BUTTON_INDEX)
+            triangle = joystick.get_button(IK_TRIGGER_BUTTON_INDEX)
+            pick_btn = joystick.get_button(PICK_BUTTON_INDEX)
+            place_btn = joystick.get_button(PLACE_BUTTON_INDEX)
         except pygame.error:
             if connected:
                 print("\n[SAFETY] Lost contact with controller! Freezing all motion.\n")
@@ -994,6 +1344,7 @@ def joystick_thread_func(
 
         joystick_states["LB"] = bool(lb)
         joystick_states["Circle"] = bool(circle)
+        joystick_states["Triangle"] = bool(triangle)
         joystick_states["PS"] = bool(ps)
 
         # Left stick: X (horizontal) => rotate, Y (vertical) => bend
@@ -1109,6 +1460,14 @@ def joystick_thread_func(
                 arming_seq.abort()
                 force_disarm_all(bus, node_ids, endpoints)
                 all_armed = False
+                ik_mode_active = False
+                ik_mode_is_catalogued = False
+                ik_catalogue_staging = False
+                ik_catalogue_final_target = None
+                ik_targets = None
+                ik_pending_grip = None
+                ik_request_thread = None  # discard any in-flight request - see 2026-08-13 note below
+                sequence_active = False  # 2026-08-17: pick/place sequence killed by E-stop too
                 joystick_states["status"] = "FORCED DISARM -- TORQUE CUT IMMEDIATELY"
                 ps_press_time = None
         else:
@@ -1124,6 +1483,24 @@ def joystick_thread_func(
             all_armed = bool(node_ids) and all(
                 read_config(bus, nid, armed_ep['id'], armed_ep['type']) for nid in node_ids
             )
+            # Any safe-return sequence completing (PS-hold or otherwise)
+            # always clears IK-mode - never silently resume chasing a
+            # stale target after a full reset, regardless of the
+            # resulting all_armed value. Requires a completely fresh
+            # Triangle-hold after any safe-return event. Also discards
+            # any in-flight background request (2026-08-13): if one
+            # completes AFTER this point, ik_request_thread being None
+            # means the polling check below simply ignores the result -
+            # the orphaned thread finishes harmlessly on its own, never
+            # resurrecting ik_mode_active after a real disarm.
+            ik_mode_active = False
+            ik_mode_is_catalogued = False
+            ik_catalogue_staging = False
+            ik_catalogue_final_target = None
+            ik_targets = None
+            ik_pending_grip = None
+            ik_request_thread = None
+            sequence_active = False  # 2026-08-17: any safe-return completing also clears an in-progress pick/place sequence
         was_seq_running = safe_return.is_running()
 
         # --- Watchdog: while driving the arm normally (not during the
@@ -1137,13 +1514,37 @@ def joystick_thread_func(
             disarm_check_counter += 1
             if disarm_check_counter % 6 == 0:
                 armed_ep = endpoints['endpoints']['axis0.is_armed']
-                dropped_now = set(nid for nid in node_ids
-                                   if read_config(bus, nid, armed_ep['id'], armed_ep['type']) is not True)
-                confirmed = dropped_now & watchdog_pending_dropped
-                watchdog_pending_dropped = dropped_now
+                readings = {nid: read_config(bus, nid, armed_ep['id'], armed_ep['type'])
+                            for nid in node_ids}
+                # 2026-08-01: an explicit False is unambiguous - the node
+                # itself reported not armed - so it now acts immediately
+                # (faster than before, which waited for a 2nd confirmation
+                # even on a clear False). A timeout (None) is ambiguous -
+                # real-world testing proved a single timed-out read can
+                # happen on a provably healthy, error-free bus - so it
+                # still needs to repeat on the next check before being
+                # trusted, same as the original debounce behavior. Applied
+                # 2026-08-18 (patch_watchdog_ambiguous_timeout.py existed
+                # unapplied since 2026-08-01; hand-applied here since this
+                # block has since grown the catalogue/sequence reset lines
+                # below that the original patch's exact-text match didn't
+                # account for).
+                confirmed_false = set(nid for nid, v in readings.items() if v is False)
+                timed_out = set(nid for nid, v in readings.items() if v is None)
+                confirmed_timeout = timed_out & watchdog_pending_dropped
+                watchdog_pending_dropped = timed_out
+                confirmed = confirmed_false | confirmed_timeout
                 if confirmed:
                     dropped = sorted(confirmed)
                     all_armed = False
+                    ik_mode_active = False
+                    ik_mode_is_catalogued = False
+                    ik_catalogue_staging = False
+                    ik_catalogue_final_target = None
+                    ik_targets = None
+                    ik_pending_grip = None
+                    ik_request_thread = None
+                    sequence_active = False  # 2026-08-17: an unexpected disarm mid-operation also kills a pick/place sequence
                     lockout_event.set()
                     print(f"\n[CRITICAL] Node(s) {dropped} unexpectedly disarmed during operation! "
                           f"All motion halted - the rest of the arm holds its last position. "
@@ -1171,38 +1572,649 @@ def joystick_thread_func(
             else:
                 motion_allowed = False
 
+        # --- IK-mode trigger: Triangle held IK_HOLD_SECONDS under the
+        # exact same conditions manual motion is already allowed under
+        # (armed, not mid-safe-return, not locked out, L1 held - the
+        # dead-man switch). Starts a BACKGROUND thread for the network
+        # call to the IK solver service on redPi (2026-08-13: this used
+        # to be a direct blocking call right here, which could freeze
+        # this ENTIRE loop - including PS-hold responsiveness - for up
+        # to its 2s timeout. Same fix pattern ArmingSequence already
+        # uses for its own multi-step operation.) The main loop never
+        # waits on it - just polls the result each frame below.
+        if motion_allowed and triangle and not ik_mode_active and ik_request_thread is None:
+            if ik_hold_start is None:
+                ik_hold_start = time.time()
+            elif time.time() - ik_hold_start >= IK_HOLD_SECONDS:
+                catalogued = read_catalogue_target()
+                if catalogued is not None:
+                    _x, _y, _z, ik_pending_grip = read_ik_target()
+                    try:
+                        with open(IK_TARGET_FILE) as _f:
+                            ik_catalogue_square_name = str(json.load(_f).get('square', '')).strip().lower()
+                    except Exception:
+                        ik_catalogue_square_name = None
+                    ik_catalogue_settle_snapshot = {}
+                    ik_catalogue_final_target = catalogued
+                    ik_targets = CATALOGUE_STAGING_TARGET
+                    ik_mode_active = True
+                    ik_mode_is_catalogued = True
+                    ik_catalogue_staging = True  # loose tolerance while True - see use_tight_tol below
+                    ik_start_time = time.time()
+                    ik_commanded_reached_time = None
+                    ik_triangle_released_since_start = False
+                    joystick_states["status"] = "IK MODE: catalogued target - staging first"
+                    print(f"[IK] Catalogued target found, staging via CATALOGUE_STAGING_TARGET first, then: {ik_catalogue_final_target}")
+                else:
+                    ik_mode_is_catalogued = False
+                    ik_catalogue_staging = False
+                    ik_catalogue_final_target = None
+                    x, y, z, ik_pending_grip = read_ik_target()
+                    ik_request_result = {}
+                    ik_request_thread = threading.Thread(
+                        target=ik_request_worker, args=(x, y, z, ik_request_result), daemon=True
+                    )
+                    ik_request_thread.start()
+                    joystick_states["status"] = "IK MODE: requesting target..."
+                ik_hold_start = None
+        elif ik_request_thread is None:
+            ik_hold_start = None
+
+        # --- Poll the background request, never block on it. Once it
+        # reports done (success, rejection, or network failure), process
+        # the result this frame and clear the thread handle.
+        if ik_request_thread is not None and ik_request_result.get('done'):
+            solve = ik_request_result.get('solve')
+            parsed_ok = False
+            if solve and solve.get("ok") and solve.get("within_urdf_bounds"):
+                # Wrapped: a malformed/unexpected response shape (e.g. a
+                # missing key) would otherwise raise uncaught here, same
+                # crash-the-whole-loop risk as the unwrapped settle-check
+                # reads found earlier. Any parse failure is treated the
+                # same as a rejected solve - safe default, never moves.
+                try:
+                    raw = solve["raw_nodes"]
+                    ik_targets = {0: raw["node0"], 1: raw["node1"], 3: raw["node3"], 4: raw["node4"], 5: raw["node5"], 6: raw["node6"]}
+                    if ik_pending_grip is not None:
+                        ik_targets[7] = ik_pending_grip
+                    parsed_ok = True
+                except Exception as e:
+                    solve = {"parse_error": str(e)}
+            if parsed_ok:
+                ik_mode_active = True
+                ik_start_time = time.time()
+                ik_commanded_reached_time = None
+                # Requires a real release-then-press before Triangle can
+                # stop it - otherwise the same continuous hold that just
+                # triggered START would immediately also trigger STOP
+                # the instant ik_mode_active flips True.
+                ik_triangle_released_since_start = False
+                joystick_states["status"] = f"IK MODE: moving to {IK_TEST_TARGET_XYZ}"
+                print(f"[IK] Target acquired: {ik_targets}")
+            else:
+                err = ik_request_result.get('error') or solve
+                joystick_states["status"] = f"IK MODE: request failed/rejected ({err})"
+                print(f"[IK] Solve rejected/failed: {err}")
+            ik_request_thread = None
+            ik_request_result = {}
+
+        # --- IK-mode stop, two independent paths, either one cancels:
+        # 1) any manual stick input - IK-mode never fights a human input.
+        # 2) a single fresh Triangle press (release-then-press, tracked
+        #    below) - the one deliberate, single-key "stop this" action.
+        # Checked every frame it's active, before movement is applied.
+        if ik_mode_active and not triangle:
+            ik_triangle_released_since_start = True
+        if ik_mode_active and triangle and ik_triangle_released_since_start:
+            ik_mode_active = False
+            ik_mode_is_catalogued = False
+            ik_catalogue_staging = False
+            ik_catalogue_final_target = None
+            ik_targets = None
+            ik_pending_grip = None
+            joystick_states["status"] = "IK MODE: stopped (Triangle pressed)"
+            print("[IK] Stopped - Triangle pressed, returning control.")
+        elif ik_mode_active and (abs(raw_bend) > 0 or abs(raw_rotate) > 0 or abs(rx) > 0 or abs(ry) > 0):
+            ik_mode_active = False
+            ik_mode_is_catalogued = False
+            ik_catalogue_staging = False
+            ik_catalogue_final_target = None
+            ik_targets = None
+            ik_pending_grip = None
+            joystick_states["status"] = "IK MODE: cancelled (manual input detected)"
+            print("[IK] Cancelled - manual stick input detected, returning control.")
+
+        # --- IK-mode overall timeout: a single hard backstop covering
+        # every possible way this could otherwise run indefinitely (a
+        # target that's unreachable within this script's real limits
+        # despite passing the IK service's own bounds check, a
+        # settle-check that never passes, anything). Always wins,
+        # regardless of cause.
+        if ik_mode_active and ik_start_time is not None and (time.time() - ik_start_time) > IK_TIMEOUT_SECONDS:
+            ik_mode_active = False
+            ik_mode_is_catalogued = False
+            ik_catalogue_staging = False
+            ik_catalogue_final_target = None
+            ik_targets = None
+            ik_pending_grip = None
+            joystick_states["status"] = "IK MODE: timed out - did not reach target in time"
+            print("[IK] Timed out - stopping, did not confirm arrival in time.")
+
+        if motion_allowed and ik_mode_active:
+            # IK-driven movement toward the fetched target - reuses the
+            # exact same taper_increment() safety/decel logic as manual
+            # moves, just with a fixed direction-to-target each frame
+            # instead of live stick input. Wrist and gripper are NOT
+            # touched here - they remain fully manual (see IK_TRIGGER_
+            # BUTTON_INDEX comment above for why).
+            all_arrived = True
+            use_tight_tol = ik_mode_is_catalogued and not ik_catalogue_staging
+            arrival_tol = CATALOGUE_ARRIVAL_TOLERANCE if use_tight_tol else IK_ARRIVAL_TOLERANCE
+            settle_tol  = CATALOGUE_SETTLE_TOLERANCE  if use_tight_tol else IK_SETTLE_TOLERANCE
+
+            # Smooth ramp from 0 to IK_VELOCITY_SCALING over IK_RAMP_UP_
+            # SECONDS, synchronized across all 4 joints (all reference
+            # the same ik_start_time) - see IK_RAMP_UP_SECONDS comment
+            # above for why: avoids commanding near-full speed on all 4
+            # joints simultaneously from a standing start.
+            ramp_factor = 1.0
+            if ik_start_time is not None:
+                ramp_factor = min(1.0, (time.time() - ik_start_time) / IK_RAMP_UP_SECONDS)
+            ik_speed = IK_VELOCITY_SCALING * ramp_factor
+
+            # Diagnostic only - throttled to ~2x/sec so it doesn't spam
+            # the log at 30Hz. Added 2026-08-13 after the first live
+            # test ended with no visibility into what happened DURING
+            # the run, only the end state - this prints live diff-to-
+            # target for every IK-controlled joint plus the current
+            # ramp/speed, so next time the actual in-progress behavior
+            # is visible, not just guessed at afterward.
+            if time.time() - ik_last_debug_print > 0.5:
+                ik_last_debug_print = time.time()
+                dbg = {}
+                if 0 in ik_targets: dbg['n0'] = round(ik_targets[0] - joint_positions[0], 4)
+                if 1 in ik_targets and shoulder_ctrl: dbg['n1'] = round(ik_targets[1] - shoulder_ctrl.value, 4)
+                if 3 in ik_targets: dbg['n3'] = round(ik_targets[3] - joint_positions[3], 4)
+                if 4 in ik_targets: dbg['n4'] = round(ik_targets[4] - joint_positions[4], 4)
+                print(f"[IK][debug] diffs={dbg} ramp={ramp_factor:.2f} speed={ik_speed:.3f} L1={'held' if lb else 'RELEASED'}")
+
+            if 0 in node_ids and 0 in ik_targets:
+                diff = ik_targets[0] - joint_positions[0]
+                if abs(diff) > arrival_tol:
+                    all_arrived = False
+                    step = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt
+                    joint_positions[0] += taper_increment(joint_positions[0], step, JOINT0_MIN, JOINT0_MAX, DECEL_ZONE)
+                    if joint_positions[0] < JOINT0_MIN: joint_positions[0] = JOINT0_MIN
+                    if joint_positions[0] > JOINT0_MAX: joint_positions[0] = JOINT0_MAX
+                move_odrive_to_position(bus, 0, joint_positions[0])
+
+            if shoulder_ctrl and (1 in node_ids) and (2 in node_ids) and 1 in ik_targets:
+                diff = ik_targets[1] - shoulder_ctrl.value
+                if abs(diff) > arrival_tol:
+                    all_arrived = False
+                    step = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt
+                    new_val = shoulder_ctrl.value + taper_increment(shoulder_ctrl.value, step, JOINT1_MIN, JOINT1_MAX, DECEL_ZONE)
+                    if new_val < JOINT1_MIN: new_val = JOINT1_MIN
+                    if new_val > JOINT1_MAX: new_val = JOINT1_MAX
+                    shoulder_ctrl.value = new_val
+                shoulder_ctrl.apply()
+
+            if 3 in node_ids and 3 in ik_targets:
+                diff = ik_targets[3] - joint_positions[3]
+                if abs(diff) > arrival_tol:
+                    all_arrived = False
+                    step = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt
+                    joint_positions[3] += taper_increment(joint_positions[3], step, JOINT2_MIN, JOINT2_MAX, DECEL_ZONE)
+                    if joint_positions[3] < JOINT2_MIN: joint_positions[3] = JOINT2_MIN
+                    if joint_positions[3] > JOINT2_MAX: joint_positions[3] = JOINT2_MAX
+                move_odrive_to_position(bus, 3, joint_positions[3])
+
+            if 4 in node_ids and 4 in ik_targets:
+                diff = ik_targets[4] - joint_positions[4]
+                if abs(diff) > arrival_tol:
+                    all_arrived = False
+                    step = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt
+                    joint_positions[4] += taper_increment(joint_positions[4], step, JOINT3_MIN, JOINT3_MAX, DECEL_ZONE)
+                    if joint_positions[4] < JOINT3_MIN: joint_positions[4] = JOINT3_MIN
+                    if joint_positions[4] > JOINT3_MAX: joint_positions[4] = JOINT3_MAX
+                move_odrive_to_position(bus, 4, joint_positions[4])
+
+            if wrist_ctrl and 5 in node_ids and 6 in node_ids and 5 in ik_targets and 6 in ik_targets:
+                # Wrist (nodes 5/6) toward its IK-solved target - same
+                # tapered-step-toward-diff pattern as the other IK joints
+                # above, but reusing the EXISTING dynamic Wrist Envelope
+                # clamp (see the manual-drive wrist block for the original
+                # derivation/history) rather than a simplified clamp, so
+                # this can never bypass that already-proven safety logic.
+                target_bend = (ik_targets[5] - ik_targets[6]) / 2.0
+                target_rotate = (ik_targets[5] + ik_targets[6]) / 2.0
+                bend_diff = target_bend - wrist_ctrl.bend_pos
+                rotate_diff = target_rotate - wrist_ctrl.rotate_pos
+                if abs(bend_diff) > arrival_tol or abs(rotate_diff) > arrival_tol:
+                    all_arrived = False
+                    bend_max_dyn   = min(BEND_MAX,   MOTOR5_MAX - wrist_ctrl.rotate_pos, wrist_ctrl.rotate_pos - MOTOR6_MIN)
+                    bend_min_dyn   = max(BEND_MIN,   MOTOR5_MIN - wrist_ctrl.rotate_pos, wrist_ctrl.rotate_pos - MOTOR6_MAX)
+                    rotate_max_dyn = min(ROTATE_MAX, MOTOR5_MAX - wrist_ctrl.bend_pos,   MOTOR6_MAX + wrist_ctrl.bend_pos)
+                    rotate_min_dyn = max(ROTATE_MIN, MOTOR5_MIN - wrist_ctrl.bend_pos,   MOTOR6_MIN + wrist_ctrl.bend_pos)
+
+                    bend_step = max(-1.0, min(1.0, bend_diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt
+                    rotate_step = max(-1.0, min(1.0, rotate_diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt
+                    # Floor the step magnitude (never the sign/direction),
+                    # only for an axis that itself still needs real
+                    # movement (its own diff exceeds tolerance) - avoids
+                    # nudging an axis that's already individually settled
+                    # just because the other axis kept this block active.
+                    if abs(bend_diff) > arrival_tol and 0 < abs(bend_step) < MIN_WRIST_IK_STEP:
+                        bend_step = MIN_WRIST_IK_STEP if bend_step > 0 else -MIN_WRIST_IK_STEP
+                    if abs(rotate_diff) > arrival_tol and 0 < abs(rotate_step) < MIN_WRIST_IK_STEP:
+                        rotate_step = MIN_WRIST_IK_STEP if rotate_step > 0 else -MIN_WRIST_IK_STEP
+                    new_bend = wrist_ctrl.bend_pos + taper_increment(wrist_ctrl.bend_pos, bend_step, bend_min_dyn, bend_max_dyn, DECEL_ZONE_WRIST_BEND)
+                    new_rotate = wrist_ctrl.rotate_pos + taper_increment(wrist_ctrl.rotate_pos, rotate_step, rotate_min_dyn, rotate_max_dyn, DECEL_ZONE_WRIST_ROTATE)
+
+                    if new_bend < bend_min_dyn: new_bend = bend_min_dyn
+                    if new_bend > bend_max_dyn: new_bend = bend_max_dyn
+                    if new_rotate < rotate_min_dyn: new_rotate = rotate_min_dyn
+                    if new_rotate > rotate_max_dyn: new_rotate = rotate_max_dyn
+
+                    wrist_ctrl.bend_pos = new_bend
+                    wrist_ctrl.rotate_pos = new_rotate
+                wrist_ctrl.apply()
+
+            if 7 in node_ids and 7 in ik_targets:
+                # Gripper (node7) toward an explicit target, only when the
+                # IK request actually specified one (ik_targets only ever
+                # gets a 7 key from the 'grip' field in ik_target.json -
+                # see read_ik_target()). Same tapered-step pattern as the
+                # other IK joints, reusing TRIGGER_MIN/MAX and
+                # DECEL_ZONE_GRIPPER - the exact same bounds the manual
+                # trigger-driven gripper block below already uses. That
+                # manual block is intentionally never gated by
+                # ik_mode_active (human can always override the grip), so
+                # it still runs every frame after this one - harmless: with
+                # no trigger pressed it just re-sends whatever this block
+                # set, and a real trigger press still moves the gripper
+                # further from wherever this block left it.
+                diff = ik_targets[7] - joint_positions[7]
+                if abs(diff) > IK_ARRIVAL_TOLERANCE:
+                    all_arrived = False
+                    step = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt
+                    joint_positions[7] += taper_increment(joint_positions[7], step, TRIGGER_MIN, TRIGGER_MAX, DECEL_ZONE_GRIPPER)
+                    if joint_positions[7] < TRIGGER_MIN: joint_positions[7] = TRIGGER_MIN
+                    if joint_positions[7] > TRIGGER_MAX: joint_positions[7] = TRIGGER_MAX
+                move_odrive_to_position(bus, 7, joint_positions[7])
+
+            if all_arrived:
+                # Commanded trajectory has reached target. Don't declare
+                # success yet - confirm against REAL live position first
+                # (joint_positions[i]/shoulder_ctrl.value above are this
+                # script's own commanded values, not a live encoder
+                # read-back - see design discussion 2026-08-13). This
+                # check is purely passive: it only ever reads position,
+                # never issues a new movement command based on what it
+                # finds - failing just means "check again next interval,"
+                # bounded by the overall IK_TIMEOUT_SECONDS backstop
+                # above, never "try to correct it."
+                if ik_commanded_reached_time is None:
+                    ik_commanded_reached_time = time.time()
+                elif (time.time() - ik_commanded_reached_time) >= IK_SETTLE_WAIT_SECONDS:
+                    # Wrapped: read_config() can return None on a CAN
+                    # timeout (handled internally, not an exception), or
+                    # raise on a deeper bus fault (not handled
+                    # internally) - there is no outer exception handler
+                    # around this whole control loop, so an uncaught
+                    # error here would crash the entire thread, killing
+                    # manual control too, not just IK-mode. Either
+                    # failure just means "can't confirm this check, try
+                    # again next interval" - same as a normal not-yet-
+                    # settled result, never a crash.
+                    settled = True
+                    try:
+                        for nid, target in ik_targets.items():
+                            # Match the exact same node_ids membership
+                            # guards the movement code above uses - a
+                            # joint that was never actually part of this
+                            # run (missing hardware) must never block
+                            # settling forever waiting on a read that
+                            # can never succeed.
+                            if nid == 0 and 0 not in node_ids:
+                                continue
+                            if nid == 1 and not (shoulder_ctrl and 1 in node_ids and 2 in node_ids):
+                                continue
+                            if nid == 3 and 3 not in node_ids:
+                                continue
+                            if nid == 4 and 4 not in node_ids:
+                                continue
+                            live = read_position(bus, nid, endpoints)
+                            if use_tight_tol:
+                                # Catalogue-replay accuracy logging only -
+                                # see the log write in "elif settled:"
+                                # below. No-op (skipped entirely) for the
+                                # normal live-solve path.
+                                ik_catalogue_settle_snapshot[nid] = (target, live)
+                            if live is None or abs(target - live) > settle_tol:
+                                settled = False
+                                break
+                    except Exception as e:
+                        settled = False
+                        print(f"[IK] Settle-check read failed ({e}) - will retry next interval.")
+
+                    if settled and ik_catalogue_staging:
+                        # Staging leg done - now drive the second, tight-
+                        # tolerance leg into the actual catalogued target,
+                        # approaching from this same known pose every time.
+                        ik_catalogue_staging = False
+                        ik_targets = ik_catalogue_final_target
+                        ik_catalogue_final_target = None
+                        ik_start_time = time.time()  # fresh IK_TIMEOUT_SECONDS budget for this leg
+                        ik_commanded_reached_time = None
+                        joystick_states["status"] = "IK MODE: staged, now approaching catalogued target"
+                        print(f"[IK] Staging leg settled - approaching final catalogued target: {ik_targets}")
+                    elif settled:
+                        if use_tight_tol:
+                            # Catalogue-replay accuracy log - local file
+                            # append only, no network, no solver call
+                            # (catalogued moves never touch the solver).
+                            # Wrapped so any failure (disk full, whatever)
+                            # is silently skipped, same as any other log
+                            # line - never something this loop waits on
+                            # or can be blocked/obstructed by.
+                            try:
+                                with open(CATALOGUE_REPLAY_LOG_FILE, 'a') as _f:
+                                    _f.write(json.dumps({
+                                        'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                                        'square': ik_catalogue_square_name,
+                                        'nodes': {
+                                            f'node{_nid}': {'target': _t, 'live': _l}
+                                            for _nid, (_t, _l) in ik_catalogue_settle_snapshot.items()
+                                        },
+                                    }) + '\n')
+                            except Exception:
+                                pass
+                        ik_mode_active = False
+                        ik_targets = None
+                        ik_pending_grip = None
+                        ik_mode_is_catalogued = False
+                        joystick_states["status"] = "IK MODE: target reached (settled)"
+                        print("[IK] Target reached and settled, returning to manual control.")
+                    else:
+                        ik_commanded_reached_time = time.time()
+                        joystick_states["status"] = "IK MODE: at target, confirming settled..."
+            else:
+                ik_commanded_reached_time = None
+
+        # --- Pick/Place sequence trigger (2026-08-17): Square (pick) /
+        # Cross (place) held PICK_PLACE_HOLD_SECONDS, same gating
+        # conditions as Triangle/IK-mode (armed, not mid-safe-return, not
+        # locked out, L1 held). Unlike Triangle, this does NOT call the
+        # live solver - it drives through a short PRE-SOLVED sequence of
+        # waypoints (see build_pick_waypoints/build_place_waypoints,
+        # generated once offline, not live) for full repeatability, per
+        # explicit request to remove solver variability from the standard
+        # pick/place motion. Mutually exclusive with ik_mode_active
+        # (Triangle) and with itself (can't start a second sequence while
+        # one is already running).
+        if motion_allowed and pick_btn and not sequence_active and not ik_mode_active:
+            if pick_hold_start is None:
+                pick_hold_start = time.time()
+            elif time.time() - pick_hold_start >= PICK_PLACE_HOLD_SECONDS:
+                grip_val = read_pick_place_grip()
+                cur = current_raw_nodes(joint_positions, shoulder_ctrl, wrist_ctrl)
+                wps = build_pick_waypoints(cur, grip_val)
+                sequence_active = True
+                sequence_kind = 'PICK'
+                sequence_square = None
+                sequence_waypoints = wps
+                sequence_index = 0
+                sequence_start_time = time.time()
+                sequence_wp_reached_time = None
+                sequence_button_released_since_start = False
+                joystick_states["status"] = f"PICK: step 1/{len(wps)}"
+                print(f"[SEQ] Starting PICK from current position, {len(wps)} steps")
+                pick_hold_start = None
+        elif not pick_btn:
+            pick_hold_start = None
+
+        if motion_allowed and place_btn and not sequence_active and not ik_mode_active:
+            if place_hold_start is None:
+                place_hold_start = time.time()
+            elif time.time() - place_hold_start >= PICK_PLACE_HOLD_SECONDS:
+                grip_val = read_pick_place_grip()
+                cur = current_raw_nodes(joint_positions, shoulder_ctrl, wrist_ctrl)
+                wps = build_place_waypoints(cur, grip_val)
+                sequence_active = True
+                sequence_kind = 'PLACE'
+                sequence_square = None
+                sequence_waypoints = wps
+                sequence_index = 0
+                sequence_start_time = time.time()
+                sequence_wp_reached_time = None
+                sequence_button_released_since_start = False
+                joystick_states["status"] = f"PLACE: step 1/{len(wps)}"
+                print(f"[SEQ] Starting PLACE from current position, {len(wps)} steps")
+                place_hold_start = None
+        elif not place_btn:
+            place_hold_start = None
+
+        # --- Sequence stop: any manual stick input always cancels
+        # immediately (never fights a human input, same rule as
+        # IK-mode). A fresh press (release-then-press) of whichever
+        # button started this sequence also cancels it - same single
+        # deliberate "stop" gesture pattern Triangle already uses.
+        if sequence_active:
+            trigger_btn = pick_btn if sequence_kind == 'PICK' else place_btn
+            if not trigger_btn:
+                sequence_button_released_since_start = True
+            if trigger_btn and sequence_button_released_since_start:
+                sequence_active = False
+                btn_name = 'Square' if sequence_kind == 'PICK' else 'Cross'
+                joystick_states["status"] = f"{sequence_kind} MODE: stopped ({btn_name} pressed)"
+                print(f"[SEQ] Stopped - button pressed, returning control.")
+            elif abs(raw_bend) > 0 or abs(raw_rotate) > 0 or abs(rx) > 0 or abs(ry) > 0:
+                sequence_active = False
+                joystick_states["status"] = f"{sequence_kind} MODE: cancelled (manual input detected)"
+                print(f"[SEQ] Cancelled - manual stick input detected, returning control.")
+
+        # --- Per-waypoint hard timeout - same reasoning as
+        # IK_TIMEOUT_SECONDS: covers a waypoint that's unreachable or
+        # never settles, so this can never run forever. Budget resets
+        # fresh for each new waypoint (see sequence_start_time reset
+        # below), not shared across the whole sequence.
+        if (sequence_active and sequence_start_time is not None
+                and (time.time() - sequence_start_time) > SEQUENCE_WP_TIMEOUT_SECONDS):
+            sequence_active = False
+            joystick_states["status"] = f"{sequence_kind} MODE: timed out on step {sequence_index + 1}/{len(sequence_waypoints)}"
+            print(f"[SEQ] Timed out on step {sequence_index + 1} - stopping.")
+
+        if motion_allowed and sequence_active:
+            # Drive toward the CURRENT waypoint - same taper_increment
+            # safety logic, ramp-up, and settle-check pattern as IK-mode
+            # above, just looped across a short list of pre-solved
+            # waypoints instead of a single live-solved target.
+            wp, grip_target, _label = sequence_waypoints[sequence_index]
+
+            all_arrived = True
+            ramp_factor = 1.0
+            if sequence_start_time is not None:
+                ramp_factor = min(1.0, (time.time() - sequence_start_time) / IK_RAMP_UP_SECONDS)
+            seq_speed = IK_VELOCITY_SCALING * ramp_factor
+
+            if 0 in node_ids:
+                diff = wp[0] - joint_positions[0]
+                if abs(diff) > SEQUENCE_ARRIVAL_TOLERANCE:
+                    all_arrived = False
+                    step_amt = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * seq_speed * dt
+                    joint_positions[0] += taper_increment(joint_positions[0], step_amt, JOINT0_MIN, JOINT0_MAX, DECEL_ZONE)
+                    if joint_positions[0] < JOINT0_MIN: joint_positions[0] = JOINT0_MIN
+                    if joint_positions[0] > JOINT0_MAX: joint_positions[0] = JOINT0_MAX
+                move_odrive_to_position(bus, 0, joint_positions[0])
+
+            if shoulder_ctrl and (1 in node_ids) and (2 in node_ids):
+                diff = wp[1] - shoulder_ctrl.value
+                if abs(diff) > SEQUENCE_ARRIVAL_TOLERANCE:
+                    all_arrived = False
+                    step_amt = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * seq_speed * dt
+                    new_val = shoulder_ctrl.value + taper_increment(shoulder_ctrl.value, step_amt, JOINT1_MIN, JOINT1_MAX, DECEL_ZONE)
+                    if new_val < JOINT1_MIN: new_val = JOINT1_MIN
+                    if new_val > JOINT1_MAX: new_val = JOINT1_MAX
+                    shoulder_ctrl.value = new_val
+                shoulder_ctrl.apply()
+
+            if 3 in node_ids:
+                diff = wp[3] - joint_positions[3]
+                if abs(diff) > SEQUENCE_ARRIVAL_TOLERANCE:
+                    all_arrived = False
+                    step_amt = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * seq_speed * dt
+                    joint_positions[3] += taper_increment(joint_positions[3], step_amt, JOINT2_MIN, JOINT2_MAX, DECEL_ZONE)
+                    if joint_positions[3] < JOINT2_MIN: joint_positions[3] = JOINT2_MIN
+                    if joint_positions[3] > JOINT2_MAX: joint_positions[3] = JOINT2_MAX
+                move_odrive_to_position(bus, 3, joint_positions[3])
+
+            if 4 in node_ids:
+                diff = wp[4] - joint_positions[4]
+                if abs(diff) > SEQUENCE_ARRIVAL_TOLERANCE:
+                    all_arrived = False
+                    step_amt = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * seq_speed * dt
+                    joint_positions[4] += taper_increment(joint_positions[4], step_amt, JOINT3_MIN, JOINT3_MAX, DECEL_ZONE)
+                    if joint_positions[4] < JOINT3_MIN: joint_positions[4] = JOINT3_MIN
+                    if joint_positions[4] > JOINT3_MAX: joint_positions[4] = JOINT3_MAX
+                move_odrive_to_position(bus, 4, joint_positions[4])
+
+            if wrist_ctrl and 5 in node_ids and 6 in node_ids:
+                target_bend = (wp[5] - wp[6]) / 2.0
+                target_rotate = (wp[5] + wp[6]) / 2.0
+                bend_diff = target_bend - wrist_ctrl.bend_pos
+                rotate_diff = target_rotate - wrist_ctrl.rotate_pos
+                if abs(bend_diff) > SEQUENCE_ARRIVAL_TOLERANCE or abs(rotate_diff) > SEQUENCE_ARRIVAL_TOLERANCE:
+                    all_arrived = False
+                    bend_max_dyn   = min(BEND_MAX,   MOTOR5_MAX - wrist_ctrl.rotate_pos, wrist_ctrl.rotate_pos - MOTOR6_MIN)
+                    bend_min_dyn   = max(BEND_MIN,   MOTOR5_MIN - wrist_ctrl.rotate_pos, wrist_ctrl.rotate_pos - MOTOR6_MAX)
+                    rotate_max_dyn = min(ROTATE_MAX, MOTOR5_MAX - wrist_ctrl.bend_pos,   MOTOR6_MAX + wrist_ctrl.bend_pos)
+                    rotate_min_dyn = max(ROTATE_MIN, MOTOR5_MIN - wrist_ctrl.bend_pos,   MOTOR6_MIN + wrist_ctrl.bend_pos)
+                    bend_step = max(-1.0, min(1.0, bend_diff / TARGET_ARRIVAL_DECEL_ZONE)) * seq_speed * dt
+                    rotate_step = max(-1.0, min(1.0, rotate_diff / TARGET_ARRIVAL_DECEL_ZONE)) * seq_speed * dt
+                    if abs(bend_diff) > SEQUENCE_ARRIVAL_TOLERANCE and 0 < abs(bend_step) < MIN_WRIST_IK_STEP:
+                        bend_step = MIN_WRIST_IK_STEP if bend_step > 0 else -MIN_WRIST_IK_STEP
+                    if abs(rotate_diff) > SEQUENCE_ARRIVAL_TOLERANCE and 0 < abs(rotate_step) < MIN_WRIST_IK_STEP:
+                        rotate_step = MIN_WRIST_IK_STEP if rotate_step > 0 else -MIN_WRIST_IK_STEP
+                    new_bend = wrist_ctrl.bend_pos + taper_increment(wrist_ctrl.bend_pos, bend_step, bend_min_dyn, bend_max_dyn, DECEL_ZONE_WRIST_BEND)
+                    new_rotate = wrist_ctrl.rotate_pos + taper_increment(wrist_ctrl.rotate_pos, rotate_step, rotate_min_dyn, rotate_max_dyn, DECEL_ZONE_WRIST_ROTATE)
+                    if new_bend < bend_min_dyn: new_bend = bend_min_dyn
+                    if new_bend > bend_max_dyn: new_bend = bend_max_dyn
+                    if new_rotate < rotate_min_dyn: new_rotate = rotate_min_dyn
+                    if new_rotate > rotate_max_dyn: new_rotate = rotate_max_dyn
+                    wrist_ctrl.bend_pos = new_bend
+                    wrist_ctrl.rotate_pos = new_rotate
+                wrist_ctrl.apply()
+
+            if 7 in node_ids:
+                diff = grip_target - joint_positions[7]
+                if abs(diff) > GRIP_ARRIVAL_TOLERANCE:
+                    all_arrived = False
+                    step_amt = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * seq_speed * dt
+                    joint_positions[7] += taper_increment(joint_positions[7], step_amt, TRIGGER_MIN, TRIGGER_MAX, DECEL_ZONE_GRIPPER)
+                    if joint_positions[7] < TRIGGER_MIN: joint_positions[7] = TRIGGER_MIN
+                    if joint_positions[7] > TRIGGER_MAX: joint_positions[7] = TRIGGER_MAX
+                move_odrive_to_position(bus, 7, joint_positions[7])
+
+            if all_arrived:
+                # Commanded trajectory reached this waypoint - confirm
+                # against REAL live position before advancing, same
+                # passive-only-never-corrects pattern as IK-mode's own
+                # settle-check.
+                if sequence_wp_reached_time is None:
+                    sequence_wp_reached_time = time.time()
+                elif (time.time() - sequence_wp_reached_time) >= SEQUENCE_SETTLE_WAIT_SECONDS:
+                    settled = True
+                    try:
+                        for nid, tgt in ((0, wp[0]), (3, wp[3]), (4, wp[4]), (7, grip_target)):
+                            if nid not in node_ids:
+                                continue
+                            live = read_position(bus, nid, endpoints)
+                            tol = GRIP_SETTLE_TOLERANCE if nid == 7 else SEQUENCE_SETTLE_TOLERANCE
+                            if live is None or abs(tgt - live) > tol:
+                                settled = False
+                                break
+                    except Exception as e:
+                        settled = False
+                        print(f"[SEQ] Settle-check read failed ({e}) - will retry next interval.")
+
+                    if settled:
+                        sequence_index += 1
+                        sequence_wp_reached_time = None
+                        sequence_start_time = time.time()  # fresh timeout budget for the next waypoint
+                        if sequence_index >= len(sequence_waypoints):
+                            joystick_states["status"] = f"{sequence_kind}: complete"
+                            print(f"[SEQ] {sequence_kind} complete.")
+                            sequence_active = False
+                        else:
+                            joystick_states["status"] = f"{sequence_kind}: step {sequence_index + 1}/{len(sequence_waypoints)}"
+                    else:
+                        sequence_wp_reached_time = time.time()
+            else:
+                sequence_wp_reached_time = None
+
         if motion_allowed:
             # Possibly controlling the normal joints or the gripper
             wrist_mode = (rb == 1)
 
-            # Joint 2 => node3 => Right Stick X
-            if 3 in node_ids:
-                joint_positions[3] += taper_increment(joint_positions[3], rx * VELOCITY_SCALING * dt, JOINT2_MIN, JOINT2_MAX, DECEL_ZONE)
-                if joint_positions[3] < JOINT2_MIN: joint_positions[3] = JOINT2_MIN 
-                if joint_positions[3] > JOINT2_MAX: joint_positions[3] = JOINT2_MAX 
-                move_odrive_to_position(bus, 3, joint_positions[3])  
+            # Require the left stick back near neutral before it's allowed
+            # to drive whichever axis set just became active (base/shoulder
+            # <-> wrist). Real bug found 2026-08-17: rb is read fresh every
+            # frame with no memory of the prior frame, so releasing R1 while
+            # the stick was still held over (e.g. mid wrist-bend) let that
+            # SAME stick deflection instantly drive base/shoulder instead,
+            # unexpectedly - reported as "joint2 moves and smashes the
+            # fingers into the board" right after releasing R1 near the
+            # board. Same fix pattern as awaiting_l1_reset above. Applies
+            # both directions (entering OR leaving wrist mode).
+            if wrist_mode != wrist_mode_prev:
+                awaiting_stick_neutral = True
+            wrist_mode_prev = wrist_mode
+            if awaiting_stick_neutral:
+                if raw_bend == 0.0 and raw_rotate == 0.0:
+                    awaiting_stick_neutral = False
+                else:
+                    raw_bend = 0.0
+                    raw_rotate = 0.0
 
-            # Joint 3 => node4 => Right Stick Y
-            if 4 in node_ids:
-                joint_positions[4] += taper_increment(joint_positions[4], ry * VELOCITY_SCALING * dt, JOINT3_MIN, JOINT3_MAX, DECEL_ZONE)
-                if joint_positions[4] < JOINT3_MIN: joint_positions[4] = JOINT3_MIN  
-                if joint_positions[4] > JOINT3_MAX: joint_positions[4] = JOINT3_MAX  
-                move_odrive_to_position(bus, 4, joint_positions[4])  
+            # While IK-mode owns base/shoulder/elbow-roll/elbow (see IK
+            # block above), skip their manual control here - but wrist
+            # and gripper below are NEVER gated by ik_mode_active, they
+            # stay fully manual throughout. Note: rx/ry/raw_rotate/
+            # raw_bend are guaranteed ~0 whenever ik_mode_active is True
+            # (any nonzero stick input cancels IK-mode the same frame,
+            # above), so this guard is a belt-and-suspenders skip, not
+            # load-bearing on its own.
+            if not ik_mode_active:
+                # Joint 2 => node3 => Right Stick X
+                if 3 in node_ids:
+                    joint_positions[3] += taper_increment(joint_positions[3], rx * VELOCITY_SCALING * dt, JOINT2_MIN, JOINT2_MAX, DECEL_ZONE)
+                    if joint_positions[3] < JOINT2_MIN: joint_positions[3] = JOINT2_MIN
+                    if joint_positions[3] > JOINT2_MAX: joint_positions[3] = JOINT2_MAX
+                    move_odrive_to_position(bus, 3, joint_positions[3])
+
+                # Joint 3 => node4 => Right Stick Y
+                if 4 in node_ids:
+                    joint_positions[4] += taper_increment(joint_positions[4], ry * VELOCITY_SCALING * dt, JOINT3_MIN, JOINT3_MAX, DECEL_ZONE)
+                    if joint_positions[4] < JOINT3_MIN: joint_positions[4] = JOINT3_MIN
+                    if joint_positions[4] > JOINT3_MAX: joint_positions[4] = JOINT3_MAX
+                    move_odrive_to_position(bus, 4, joint_positions[4])
 
             if not wrist_mode:
                 # Normal left-stick => Joint 0 (node0, horizontal) & Joint 1 (node1,2, vertical)
-                if 0 in node_ids:
-                    joint_positions[0] += taper_increment(joint_positions[0], raw_rotate * VELOCITY_SCALING * dt, JOINT0_MIN, JOINT0_MAX, DECEL_ZONE)
-                    if joint_positions[0] < JOINT0_MIN: joint_positions[0] = JOINT0_MIN
-                    if joint_positions[0] > JOINT0_MAX: joint_positions[0] = JOINT0_MAX
-                    move_odrive_to_position(bus, 0, joint_positions[0])
+                if not ik_mode_active:
+                    if 0 in node_ids:
+                        joint_positions[0] += taper_increment(joint_positions[0], raw_rotate * VELOCITY_SCALING * dt, JOINT0_MIN, JOINT0_MAX, DECEL_ZONE)
+                        if joint_positions[0] < JOINT0_MIN: joint_positions[0] = JOINT0_MIN
+                        if joint_positions[0] > JOINT0_MAX: joint_positions[0] = JOINT0_MAX
+                        move_odrive_to_position(bus, 0, joint_positions[0])
 
-                if shoulder_ctrl and (1 in node_ids) and (2 in node_ids):
-                    new_val = shoulder_ctrl.value + taper_increment(shoulder_ctrl.value, raw_bend * VELOCITY_SCALING * dt, JOINT1_MIN, JOINT1_MAX, DECEL_ZONE)
-                    if new_val < JOINT1_MIN: new_val = JOINT1_MIN
-                    if new_val > JOINT1_MAX: new_val = JOINT1_MAX
-                    shoulder_ctrl.value = new_val
-                    shoulder_ctrl.apply()
+                    if shoulder_ctrl and (1 in node_ids) and (2 in node_ids):
+                        new_val = shoulder_ctrl.value + taper_increment(shoulder_ctrl.value, raw_bend * SHOULDER_VELOCITY_SCALING * dt, JOINT1_MIN, JOINT1_MAX, DECEL_ZONE)
+                        if new_val < JOINT1_MIN: new_val = JOINT1_MIN
+                        if new_val > JOINT1_MAX: new_val = JOINT1_MAX
+                        shoulder_ctrl.value = new_val
+                        shoulder_ctrl.apply()
 
             else:
                 # Wrist mode => node5,6
@@ -1227,8 +2239,8 @@ def joystick_thread_func(
                     rotate_max_dyn = min(ROTATE_MAX, MOTOR5_MAX - wrist_ctrl.bend_pos,   MOTOR6_MAX + wrist_ctrl.bend_pos)
                     rotate_min_dyn = max(ROTATE_MIN, MOTOR5_MIN - wrist_ctrl.bend_pos,   MOTOR6_MIN + wrist_ctrl.bend_pos)
 
-                    new_bend   = wrist_ctrl.bend_pos   + taper_increment(wrist_ctrl.bend_pos, wrist_bend_input * VELOCITY_SCALING * FOREARM_VELOCITY_SCALING * dt, bend_min_dyn, bend_max_dyn, DECEL_ZONE_WRIST)
-                    new_rotate = wrist_ctrl.rotate_pos + taper_increment(wrist_ctrl.rotate_pos, wrist_rotate_input * VELOCITY_SCALING * FOREARM_VELOCITY_SCALING * dt, rotate_min_dyn, rotate_max_dyn, DECEL_ZONE_WRIST)
+                    new_bend   = wrist_ctrl.bend_pos   + taper_increment(wrist_ctrl.bend_pos, wrist_bend_input * VELOCITY_SCALING * FOREARM_VELOCITY_SCALING * dt, bend_min_dyn, bend_max_dyn, DECEL_ZONE_WRIST_BEND)
+                    new_rotate = wrist_ctrl.rotate_pos + taper_increment(wrist_ctrl.rotate_pos, wrist_rotate_input * VELOCITY_SCALING * FOREARM_VELOCITY_SCALING * dt, rotate_min_dyn, rotate_max_dyn, DECEL_ZONE_WRIST_ROTATE)
 
                     if new_bend < bend_min_dyn: new_bend = bend_min_dyn
                     if new_bend > bend_max_dyn: new_bend = bend_max_dyn
