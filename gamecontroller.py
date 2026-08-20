@@ -230,7 +230,13 @@ GRIP_SETTLE_TOLERANCE  = 0.05
 # spread across those squares was small, so it should be close enough
 # across the actual working region above the board.
 PICK_PLACE_DESCEND_DELTA = {
-    0: 0.0376, 1: -0.0475, 3: 0.0, 4: -0.1245, 5: 0.2422, 6: -0.2421,
+    # node5/node6 zeroed 2026-08-20 - the averaged delta included a real
+    # ~0.24 rad wrist-bend shift from the old board's reference squares,
+    # confirmed live as an unwanted wrist tilt on the new 48mmRoll board
+    # (Carla: "if it just closed all the way the first time and then
+    # lifted it would work"). Descend/lift is now a straight vertical
+    # move, no wrist tilt.
+    0: 0.0376, 1: -0.0475, 3: 0.0, 4: -0.1245, 5: 0.0, 6: 0.0,
 }
 PICK_PLACE_GRIP_DEFAULT = -0.85  # tightened 2026-08-17 after live test - old -0.565 (chess_move_
                                   # sequencer.py's default) was too wide to actually hold the piece,
@@ -393,9 +399,13 @@ SAFE_UP_WRIST_BEND     = -0.0353  # WriteController.bend_pos; rotate_pos is left
 # hit the board/pieces if it drifts, while still clearing piece height
 # on the way in (manually posed and captured live, same method as
 # safe_up_pos originally was - not derived through any FK chain).
+# Updated again 2026-08-20 ("chess ready pos" in Carla's recording tool)
+# - the previous pose required an unnecessary CCW-then-CW node0 swing to
+# reach from a typical approach direction; this pose was chosen and
+# captured live specifically to avoid that.
 CATALOGUE_STAGING_TARGET = {
-    0: -3.128562, 1: -4.275810, 3: 0.0,
-    4: 5.663924, 5: 0.421712, 6: -0.405434,
+    0: -2.245401, 1: -4.187480, 3: -0.000109,
+    4: 5.772602, 5: 2.019778, 6: -2.017101,
 }
 GRIPPER_RELEASE_OPEN   = 0.0       # Fully open in the NEW reference frame
                                     # (2026-07-30, after the encoder mount was
@@ -1259,6 +1269,13 @@ def joystick_thread_func(
     awaiting_stick_neutral = False
     pick_hold_start        = None
     place_hold_start       = None
+    pick_btn_consumed      = False  # 2026-08-20: one PICK per press, not one per PICK_PLACE_HOLD_SECONDS
+    place_btn_consumed     = False  # while the button stays held - see trigger block below
+    carrying_piece         = False  # 2026-08-20: set True only on a full PICK completion, False on
+                                     # a full PLACE completion (or any E-stop/safe-return/disarm reset
+                                     # below) - gates skipping the catalogue staging leg, since the
+                                     # fingers aren't designed to hold a piece securely through that
+                                     # detour move. See the Triangle trigger block for how it's used.
     sequence_active        = False
     sequence_kind          = None
     sequence_square        = None
@@ -1468,6 +1485,7 @@ def joystick_thread_func(
                 ik_pending_grip = None
                 ik_request_thread = None  # discard any in-flight request - see 2026-08-13 note below
                 sequence_active = False  # 2026-08-17: pick/place sequence killed by E-stop too
+                carrying_piece = False  # 2026-08-20: physical state uncertain after E-stop - default to staging next time
                 joystick_states["status"] = "FORCED DISARM -- TORQUE CUT IMMEDIATELY"
                 ps_press_time = None
         else:
@@ -1501,6 +1519,7 @@ def joystick_thread_func(
             ik_pending_grip = None
             ik_request_thread = None
             sequence_active = False  # 2026-08-17: any safe-return completing also clears an in-progress pick/place sequence
+            carrying_piece = False  # 2026-08-20: safe-return opens the gripper as part of its own staged sequence
         was_seq_running = safe_return.is_running()
 
         # --- Watchdog: while driving the arm normally (not during the
@@ -1545,6 +1564,7 @@ def joystick_thread_func(
                     ik_pending_grip = None
                     ik_request_thread = None
                     sequence_active = False  # 2026-08-17: an unexpected disarm mid-operation also kills a pick/place sequence
+                    carrying_piece = False  # 2026-08-20: physical state uncertain after an unexpected disarm - default to staging next time
                     lockout_event.set()
                     print(f"\n[CRITICAL] Node(s) {dropped} unexpectedly disarmed during operation! "
                           f"All motion halted - the rest of the arm holds its last position. "
@@ -1596,15 +1616,28 @@ def joystick_thread_func(
                         ik_catalogue_square_name = None
                     ik_catalogue_settle_snapshot = {}
                     ik_catalogue_final_target = catalogued
-                    ik_targets = CATALOGUE_STAGING_TARGET
+                    if carrying_piece:
+                        # 2026-08-20: skip the staging leg entirely while
+                        # holding a piece - the fingers aren't designed to
+                        # hold securely through that extra detour move.
+                        # Real backlash risk (the reason staging exists
+                        # at all) is knowingly accepted for this one leg;
+                        # approaching a pick target (nothing held) still
+                        # stages normally below.
+                        ik_targets = catalogued
+                        ik_catalogue_staging = False  # tight tolerance immediately - use_tight_tol below
+                        joystick_states["status"] = "IK MODE: catalogued target - carrying piece, skipping staging"
+                        print(f"[IK] Catalogued target found, carrying piece - going direct (no staging): {ik_catalogue_final_target}")
+                    else:
+                        ik_targets = CATALOGUE_STAGING_TARGET
+                        ik_catalogue_staging = True  # loose tolerance while True - see use_tight_tol below
+                        joystick_states["status"] = "IK MODE: catalogued target - staging first"
+                        print(f"[IK] Catalogued target found, staging via CATALOGUE_STAGING_TARGET first, then: {ik_catalogue_final_target}")
                     ik_mode_active = True
                     ik_mode_is_catalogued = True
-                    ik_catalogue_staging = True  # loose tolerance while True - see use_tight_tol below
                     ik_start_time = time.time()
                     ik_commanded_reached_time = None
                     ik_triangle_released_since_start = False
-                    joystick_states["status"] = "IK MODE: catalogued target - staging first"
-                    print(f"[IK] Catalogued target found, staging via CATALOGUE_STAGING_TARGET first, then: {ik_catalogue_final_target}")
                 else:
                     ik_mode_is_catalogued = False
                     ik_catalogue_staging = False
@@ -1953,7 +1986,19 @@ def joystick_thread_func(
         # pick/place motion. Mutually exclusive with ik_mode_active
         # (Triangle) and with itself (can't start a second sequence while
         # one is already running).
-        if motion_allowed and pick_btn and not sequence_active and not ik_mode_active:
+        # 2026-08-20: pick_btn_consumed/place_btn_consumed gate a fresh
+        # press - without this, completing a sequence just sets
+        # sequence_active back to False, and if the button is still
+        # physically held the very next frame satisfies "pressed and not
+        # already running" again, silently starting a brand new sequence
+        # from scratch. Live-confirmed real bug: holding Square produced
+        # a repeating grab/release/grab cycle (each restart's first steps
+        # re-command the gripper toward the more-open
+        # PICK_PLACE_RELEASE_VALUE) for as long as the button stayed
+        # held, instead of one clean pick. Now requires an actual
+        # release before a new press can trigger anything again - one
+        # hold, one sequence, no matter how long the button stays down.
+        if motion_allowed and pick_btn and not pick_btn_consumed and not sequence_active and not ik_mode_active:
             if pick_hold_start is None:
                 pick_hold_start = time.time()
             elif time.time() - pick_hold_start >= PICK_PLACE_HOLD_SECONDS:
@@ -1971,10 +2016,12 @@ def joystick_thread_func(
                 joystick_states["status"] = f"PICK: step 1/{len(wps)}"
                 print(f"[SEQ] Starting PICK from current position, {len(wps)} steps")
                 pick_hold_start = None
+                pick_btn_consumed = True
         elif not pick_btn:
             pick_hold_start = None
+            pick_btn_consumed = False
 
-        if motion_allowed and place_btn and not sequence_active and not ik_mode_active:
+        if motion_allowed and place_btn and not place_btn_consumed and not sequence_active and not ik_mode_active:
             if place_hold_start is None:
                 place_hold_start = time.time()
             elif time.time() - place_hold_start >= PICK_PLACE_HOLD_SECONDS:
@@ -1992,8 +2039,10 @@ def joystick_thread_func(
                 joystick_states["status"] = f"PLACE: step 1/{len(wps)}"
                 print(f"[SEQ] Starting PLACE from current position, {len(wps)} steps")
                 place_hold_start = None
+                place_btn_consumed = True
         elif not place_btn:
             place_hold_start = None
+            place_btn_consumed = False
 
         # --- Sequence stop: any manual stick input always cancels
         # immediately (never fights a human input, same rule as
@@ -2146,6 +2195,10 @@ def joystick_thread_func(
                             joystick_states["status"] = f"{sequence_kind}: complete"
                             print(f"[SEQ] {sequence_kind} complete.")
                             sequence_active = False
+                            carrying_piece = (sequence_kind == 'PICK')  # 2026-08-20: only a genuine
+                            # full completion updates this - a cancelled/timed-out PICK never
+                            # reliably grabbed anything, and a cancelled/timed-out PLACE may still
+                            # be holding the piece, so those paths leave carrying_piece unchanged
                         else:
                             joystick_states["status"] = f"{sequence_kind}: step {sequence_index + 1}/{len(sequence_waypoints)}"
                     else:
