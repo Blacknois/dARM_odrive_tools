@@ -101,9 +101,6 @@ for sq in manual:
 squares_out = {}
 for f_ in FILES:
     for r_i, r_ in enumerate(RANKS):
-        r_num = r_i + 1
-        if not (1 <= r_num <= 7):  # matches calibrate_board.py's default --rows 1-7
-            continue
         sq = f_ + r_
         fi = FILES.index(f_) - FILES.index(anchor_sq[0])
         ri = r_i - RANKS.index(anchor_sq[1])
