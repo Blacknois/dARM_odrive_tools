@@ -2,6 +2,7 @@
 
 import time
 import os
+import math
 import threading
 import signal
 import urwid
@@ -218,26 +219,25 @@ GRIP_SETTLE_TOLERANCE  = 0.05
 # Real design intent (corrected 2026-08-17 after first version wrongly
 # jumped to an absolute pre-solved square position and produced a big
 # unexpected whole-arm sweep): Triangle already gets the arm TO a target
-# via a live solve - Square/Cross do NOT repeat that. They perform a
-# standard, repeatable LOCAL descend/grip/lift starting from wherever
-# the arm already is the moment the button is pressed. "How far down is
-# down" can't be a fixed raw-joint number (needs coordinated multi-joint
-# movement that depends on the arm's current pose), so this fixed delta
-# was derived ONCE (not solved live) by averaging the real hover->descend
-# offset across several known-good, low-error solved squares near the
-# board's working area (d2/d4/e4/d3/e3/c3/f3) - see session notes. This
-# is an approximation, not exact for every possible arm pose, but the
-# spread across those squares was small, so it should be close enough
-# across the actual working region above the board.
-PICK_PLACE_DESCEND_DELTA = {
-    # node5/node6 zeroed 2026-08-20 - the averaged delta included a real
-    # ~0.24 rad wrist-bend shift from the old board's reference squares,
-    # confirmed live as an unwanted wrist tilt on the new 48mmRoll board
-    # (Carla: "if it just closed all the way the first time and then
-    # lifted it would work"). Descend/lift is now a straight vertical
-    # move, no wrist tilt.
-    0: 0.0376, 1: -0.0475, 3: 0.0, 4: -0.1245, 5: 0.0, 6: 0.0,
-}
+# via a live solve - Square/Cross's hover/lift legs still don't repeat
+# that, staying purely local. The descend leg is the exception (added
+# 2026-08-22): a fixed raw-joint delta (PICK_PLACE_DESCEND_DELTA, now
+# removed) worked fine for the old short descend, but after the board
+# was physically lowered ~136mm for piece-carry clearance, the real
+# descend became ~69mm - live-measured via forward kinematics on 3
+# squares (e3/d4/f3: -66.6mm/-68.8mm/-72.4mm, a tight spread) - and the
+# RAW-JOINT delta needed to cover that varied nearly 2x by square
+# (real radius-dependent wrist tilt, an arm with a fixed base needs a
+# different wrist angle to point straight down at different reach
+# distances). No single fixed raw offset covers that; see
+# darm_feature_backlog.md. So descend is now solved live via the same
+# redPi ik_solver_service Triangle already uses (see
+# solve_descend_target()), constrained to straight down (same x/y as
+# hover, z reduced by DESCEND_DROP_M) - not a general live-solve to an
+# arbitrary target, so it keeps the "no unexpected whole-arm sweep"
+# guarantee the 2026-08-17 redesign was about.
+DESCEND_DROP_M = 0.069  # real measured average hover->grip vertical drop,
+                         # see the FK measurement above.
 PICK_PLACE_GRIP_DEFAULT = -0.85  # tightened 2026-08-17 after live test - old -0.565 (chess_move_
                                   # sequencer.py's default) was too wide to actually hold the piece,
                                   # confirmed live ("would have worked if it closed farther").
@@ -280,30 +280,127 @@ def current_raw_nodes(joint_positions, shoulder_ctrl, wrist_ctrl):
     }
 
 
-def build_pick_waypoints(current_raw, grip_closed):
-    """Standard repeatable pick pattern (hover -> descend -> grip -> lift),
-    RELATIVE to wherever the arm currently is - hover IS the current
-    position, descend is current + PICK_PLACE_DESCEND_DELTA."""
+# --- Forward kinematics for the descend solve (2026-08-22) -----------------
+# Duplicated from chess_move_sequencer.py's own FK chain (not imported -
+# the two files aren't otherwise coupled), adapted to take current_raw_nodes()'s
+# int-keyed dict instead of that file's string-keyed one. Any future
+# CAD/finger geometry change needs both copies updated by hand - same
+# caveat chess_move_sequencer.py's own FINGER_TIP_OFFSET comment already
+# notes for itself. The rotation-matrix helpers are named fk_rx/fk_rz
+# (not rx/rz) specifically because rx/ry are already live joystick-axis
+# variable names elsewhere in this file's main loop - reusing those names
+# here would silently shadow them and break stick input.
+FK_DEG = math.pi / 180.0
+FK_SCALE_8308 = 40.06
+FK_SCALE_SHOULDER = 41.6
+FK_SCALE_ELBOW = 40.73
+FK_SCALE_WRIST_BEND = 29.1
+FK_SCALE_WRIST_ROTATE = 27.7
+FK_SHOULDER_CAD_MAX_DEG = 226.0
+FK_ELBOW_CAD_MAX_DEG = 245.8
+FK_BASE_OFFSET_DEG = 26.59
+FK_FINGER_TIP_OFFSET = (-0.039715, 0.004364, 0.082)
+
+
+def raw_to_joint_angles(raw_nodes):
+    n0 = raw_nodes.get(0, 0.0) or 0.0
+    n12 = raw_nodes.get(1, 0.0) or 0.0
+    n3 = raw_nodes.get(3, 0.0) or 0.0
+    n4 = raw_nodes.get(4, 0.0) or 0.0
+    n5 = raw_nodes.get(5, 0.0) or 0.0
+    n6 = raw_nodes.get(6, 0.0) or 0.0
+    bend_pos = (n5 - n6) / 2.0
+    rotate_pos = (n5 + n6) / 2.0
+    return {
+        'link_1': -n0 * FK_SCALE_8308 * FK_DEG + FK_BASE_OFFSET_DEG * FK_DEG,
+        'link_2': (FK_SHOULDER_CAD_MAX_DEG + n12 * FK_SCALE_SHOULDER) * FK_DEG,
+        'link_3': -n3 * FK_SCALE_8308 * FK_DEG,
+        'forearm': (FK_ELBOW_CAD_MAX_DEG - n4 * FK_SCALE_ELBOW) * FK_DEG,
+        'differential': bend_pos * FK_SCALE_WRIST_BEND * FK_DEG,
+        'gripper': rotate_pos * FK_SCALE_WRIST_ROTATE * FK_DEG,
+    }
+
+
+def fk_rx(a):
+    c, s = math.cos(a), math.sin(a)
+    return ((1, 0, 0), (0, c, -s), (0, s, c))
+
+
+def fk_rz(a):
+    c, s = math.cos(a), math.sin(a)
+    return ((c, -s, 0), (s, c, 0), (0, 0, 1))
+
+
+def fk_mat_mult(A, B):
+    return tuple(tuple(sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)) for i in range(3))
+
+
+def fk_mat_vec(A, v):
+    return tuple(sum(A[i][k] * v[k] for k in range(3)) for i in range(3))
+
+
+def fk_add(a, b):
+    return tuple(a[i] + b[i] for i in range(3))
+
+
+def fk_compose(T1, T2):
+    """T = (R, t). Composing T1 after T2: point -> T1(T2(point))."""
+    R1, t1 = T1
+    R2, t2 = T2
+    R = fk_mat_mult(R1, R2)
+    t = fk_add(fk_mat_vec(R1, t2), t1)
+    return (R, t)
+
+
+FK_IDENTITY = (((1, 0, 0), (0, 1, 0), (0, 0, 1)), (0, 0, 0))
+
+
+def fk_finger_tip(angles):
+    """Same chain as chess_move_sequencer.py's fk_finger_tip() - see its
+    own comment for validation history."""
+    T = FK_IDENTITY
+    T = fk_compose(T, (fk_rz(angles['link_1']), (0, 0, 0.14444)))
+    T = fk_compose(T, (fk_mat_mult(fk_rx(-113 * FK_DEG), fk_rx(angles['link_2'])), (0, 0, 0.07556)))
+    T = fk_compose(T, (fk_rz(angles['link_3']), (0, 0, 0.18708)))
+    T = fk_compose(T, (fk_mat_mult(fk_rx(122.9 * FK_DEG), fk_rx(-angles['forearm'])), (0, 0, 0.06292)))
+    T = fk_compose(T, (fk_rx(angles['differential']), (0, 0, 0.34)))
+    T = fk_compose(T, (fk_rz(-angles['gripper']), (0, 0, 0.02)))
+    T = fk_compose(T, (FK_IDENTITY[0], (0.05, -0.0035, 0.091365)))
+    T = fk_compose(T, (FK_IDENTITY[0], FK_FINGER_TIP_OFFSET))
+    _R, t = T
+    return t
+
+
+def hover_xyz_from_raw(raw_nodes):
+    """Real-world fingertip (x, y, z) in meters for a raw-joint hover
+    position - used to build the straight-down descend target for
+    solve_descend_target() below."""
+    return fk_finger_tip(raw_to_joint_angles(raw_nodes))
+
+
+def build_pick_waypoints(current_raw, descend_raw, grip_closed):
+    """Standard repeatable pick pattern (hover -> descend -> grip -> lift).
+    hover is wherever the arm currently is; descend is a live IK-solved
+    straight-down target (see DESCEND_DROP_M / the pick/place trigger
+    block), not a fixed raw-joint offset."""
     hover = dict(current_raw)
-    descend = {k: current_raw[k] + PICK_PLACE_DESCEND_DELTA[k] for k in current_raw}
     return [
-        (hover,   PICK_PLACE_RELEASE_VALUE, "hover (current position)"),
-        (descend, PICK_PLACE_RELEASE_VALUE, "descend"),
-        (descend, grip_closed,              "grip"),
-        (hover,   grip_closed,              "lift"),
+        (hover,       PICK_PLACE_RELEASE_VALUE, "hover (current position)"),
+        (descend_raw, PICK_PLACE_RELEASE_VALUE, "descend"),
+        (descend_raw, grip_closed,              "grip"),
+        (hover,       grip_closed,              "lift"),
     ]
 
 
-def build_place_waypoints(current_raw, grip_closed):
+def build_place_waypoints(current_raw, descend_raw, grip_closed):
     """Standard repeatable place pattern (hover -> descend -> release ->
-    lift), same relative-to-current-position basis as build_pick_waypoints()."""
+    lift), same basis as build_pick_waypoints()."""
     hover = dict(current_raw)
-    descend = {k: current_raw[k] + PICK_PLACE_DESCEND_DELTA[k] for k in current_raw}
     return [
-        (hover,   grip_closed,              "hover (current position)"),
-        (descend, grip_closed,              "descend"),
-        (descend, PICK_PLACE_RELEASE_VALUE, "release"),
-        (hover,   PICK_PLACE_RELEASE_VALUE, "lift"),
+        (hover,       grip_closed,              "hover (current position)"),
+        (descend_raw, grip_closed,              "descend"),
+        (descend_raw, PICK_PLACE_RELEASE_VALUE, "release"),
+        (hover,       PICK_PLACE_RELEASE_VALUE, "lift"),
     ]
 
 AXIS_LEFT_X       = 0  # Left stick horizontal
@@ -1284,6 +1381,18 @@ def joystick_thread_func(
     sequence_start_time    = None
     sequence_wp_reached_time = None
     sequence_button_released_since_start = False
+    pick_place_solving      = None  # None | 'PICK' | 'PLACE' - 2026-08-22:
+                                     # True while waiting on the async
+                                     # descend IK solve (see
+                                     # solve_descend_target below),
+                                     # before sequence_active/waypoints
+                                     # exist yet. Replaces the old fixed
+                                     # PICK_PLACE_DESCEND_DELTA - see
+                                     # DESCEND_DROP_M's comment for why.
+    pick_place_solve_thread = None
+    pick_place_solve_result = {}
+    pick_place_solve_hover  = None  # captured hover raw_nodes, held across the async wait
+    pick_place_solve_grip   = None  # captured grip_val, held across the async wait
     ps_prev               = False
     ps_press_time         = None
     all_armed             = False
@@ -1485,6 +1594,9 @@ def joystick_thread_func(
                 ik_pending_grip = None
                 ik_request_thread = None  # discard any in-flight request - see 2026-08-13 note below
                 sequence_active = False  # 2026-08-17: pick/place sequence killed by E-stop too
+                pick_place_solving = None  # 2026-08-22: discard any in-flight descend solve too
+                pick_place_solve_thread = None
+                pick_place_solve_result = {}
                 carrying_piece = False  # 2026-08-20: physical state uncertain after E-stop - default to staging next time
                 joystick_states["status"] = "FORCED DISARM -- TORQUE CUT IMMEDIATELY"
                 ps_press_time = None
@@ -1519,6 +1631,9 @@ def joystick_thread_func(
             ik_pending_grip = None
             ik_request_thread = None
             sequence_active = False  # 2026-08-17: any safe-return completing also clears an in-progress pick/place sequence
+            pick_place_solving = None  # 2026-08-22: discard any in-flight descend solve too
+            pick_place_solve_thread = None
+            pick_place_solve_result = {}
             carrying_piece = False  # 2026-08-20: safe-return opens the gripper as part of its own staged sequence
         was_seq_running = safe_return.is_running()
 
@@ -1564,6 +1679,9 @@ def joystick_thread_func(
                     ik_pending_grip = None
                     ik_request_thread = None
                     sequence_active = False  # 2026-08-17: an unexpected disarm mid-operation also kills a pick/place sequence
+                    pick_place_solving = None  # 2026-08-22: discard any in-flight descend solve too
+                    pick_place_solve_thread = None
+                    pick_place_solve_result = {}
                     carrying_piece = False  # 2026-08-20: physical state uncertain after an unexpected disarm - default to staging next time
                     lockout_event.set()
                     print(f"\n[CRITICAL] Node(s) {dropped} unexpectedly disarmed during operation! "
@@ -1998,51 +2116,111 @@ def joystick_thread_func(
         # held, instead of one clean pick. Now requires an actual
         # release before a new press can trigger anything again - one
         # hold, one sequence, no matter how long the button stays down.
-        if motion_allowed and pick_btn and not pick_btn_consumed and not sequence_active and not ik_mode_active:
+        if motion_allowed and pick_btn and not pick_btn_consumed and not sequence_active and not ik_mode_active and not pick_place_solving:
             if pick_hold_start is None:
                 pick_hold_start = time.time()
             elif time.time() - pick_hold_start >= PICK_PLACE_HOLD_SECONDS:
                 grip_val = read_pick_place_grip()
                 cur = current_raw_nodes(joint_positions, shoulder_ctrl, wrist_ctrl)
-                wps = build_pick_waypoints(cur, grip_val)
-                sequence_active = True
-                sequence_kind = 'PICK'
-                sequence_square = None
-                sequence_waypoints = wps
-                sequence_index = 0
-                sequence_start_time = time.time()
-                sequence_wp_reached_time = None
-                sequence_button_released_since_start = False
-                joystick_states["status"] = f"PICK: step 1/{len(wps)}"
-                print(f"[SEQ] Starting PICK from current position, {len(wps)} steps")
+                hx, hy, hz = hover_xyz_from_raw(cur)
+                pick_place_solve_result = {}
+                pick_place_solve_thread = threading.Thread(
+                    target=ik_request_worker, args=(hx, hy, hz - DESCEND_DROP_M, pick_place_solve_result), daemon=True
+                )
+                pick_place_solve_thread.start()
+                pick_place_solving = 'PICK'
+                pick_place_solve_hover = cur
+                pick_place_solve_grip = grip_val
+                joystick_states["status"] = "PICK: solving descend..."
+                print(f"[SEQ] PICK triggered - solving descend target from hover {cur}")
                 pick_hold_start = None
                 pick_btn_consumed = True
         elif not pick_btn:
             pick_hold_start = None
             pick_btn_consumed = False
 
-        if motion_allowed and place_btn and not place_btn_consumed and not sequence_active and not ik_mode_active:
+        if motion_allowed and place_btn and not place_btn_consumed and not sequence_active and not ik_mode_active and not pick_place_solving:
             if place_hold_start is None:
                 place_hold_start = time.time()
             elif time.time() - place_hold_start >= PICK_PLACE_HOLD_SECONDS:
                 grip_val = read_pick_place_grip()
                 cur = current_raw_nodes(joint_positions, shoulder_ctrl, wrist_ctrl)
-                wps = build_place_waypoints(cur, grip_val)
+                hx, hy, hz = hover_xyz_from_raw(cur)
+                pick_place_solve_result = {}
+                pick_place_solve_thread = threading.Thread(
+                    target=ik_request_worker, args=(hx, hy, hz - DESCEND_DROP_M, pick_place_solve_result), daemon=True
+                )
+                pick_place_solve_thread.start()
+                pick_place_solving = 'PLACE'
+                pick_place_solve_hover = cur
+                pick_place_solve_grip = grip_val
+                joystick_states["status"] = "PLACE: solving descend..."
+                print(f"[SEQ] PLACE triggered - solving descend target from hover {cur}")
+                place_hold_start = None
+                place_btn_consumed = True
+        elif not place_btn:
+            place_hold_start = None
+            place_btn_consumed = False
+
+        # --- Cancel an in-flight descend solve if the trigger button is
+        # released before the solve returns, or if manual input arrives -
+        # same "never fights a human input" rule as everywhere else in
+        # this file. Nothing has moved yet at this point (the solve is
+        # purely a network round-trip), so cancelling is just dropping
+        # the pending result - the background thread (if still running)
+        # finishes harmlessly on its own, same orphan-handling as
+        # ik_request_thread's own case above.
+        if pick_place_solving:
+            trigger_btn = pick_btn if pick_place_solving == 'PICK' else place_btn
+            if not trigger_btn or abs(raw_bend) > 0 or abs(raw_rotate) > 0 or abs(rx) > 0 or abs(ry) > 0:
+                print(f"[SEQ] {pick_place_solving} cancelled - button released or manual input before descend solve completed.")
+                joystick_states["status"] = f"{pick_place_solving}: cancelled before descend solved"
+                pick_place_solving = None
+                pick_place_solve_thread = None
+                pick_place_solve_result = {}
+                pick_place_solve_hover = None
+                pick_place_solve_grip = None
+
+        # --- Poll the background descend solve, same never-block pattern
+        # as Triangle's ik_request_thread poll above. On success, NOW
+        # build the waypoint list (hover was already captured at trigger
+        # time) and hand off into the existing sequence_active stepping
+        # logic below, completely unchanged from here.
+        if pick_place_solving and pick_place_solve_result.get('done'):
+            solve = pick_place_solve_result.get('solve')
+            parsed_ok = False
+            if solve and solve.get("ok") and solve.get("within_urdf_bounds"):
+                try:
+                    raw = solve["raw_nodes"]
+                    descend_raw = {0: raw["node0"], 1: raw["node1"], 3: raw["node3"],
+                                    4: raw["node4"], 5: raw["node5"], 6: raw["node6"]}
+                    parsed_ok = True
+                except Exception as e:
+                    solve = {"parse_error": str(e)}
+            if parsed_ok:
+                if pick_place_solving == 'PICK':
+                    wps = build_pick_waypoints(pick_place_solve_hover, descend_raw, pick_place_solve_grip)
+                else:
+                    wps = build_place_waypoints(pick_place_solve_hover, descend_raw, pick_place_solve_grip)
                 sequence_active = True
-                sequence_kind = 'PLACE'
+                sequence_kind = pick_place_solving
                 sequence_square = None
                 sequence_waypoints = wps
                 sequence_index = 0
                 sequence_start_time = time.time()
                 sequence_wp_reached_time = None
                 sequence_button_released_since_start = False
-                joystick_states["status"] = f"PLACE: step 1/{len(wps)}"
-                print(f"[SEQ] Starting PLACE from current position, {len(wps)} steps")
-                place_hold_start = None
-                place_btn_consumed = True
-        elif not place_btn:
-            place_hold_start = None
-            place_btn_consumed = False
+                joystick_states["status"] = f"{sequence_kind}: step 1/{len(wps)}"
+                print(f"[SEQ] Descend solved, starting {sequence_kind}, {len(wps)} steps: {descend_raw}")
+            else:
+                err = pick_place_solve_result.get('error') or solve
+                joystick_states["status"] = f"PICK/PLACE: descend solve failed/rejected ({err})"
+                print(f"[SEQ] Descend solve rejected/failed - aborting, no motion: {err}")
+            pick_place_solving = None
+            pick_place_solve_thread = None
+            pick_place_solve_result = {}
+            pick_place_solve_hover = None
+            pick_place_solve_grip = None
 
         # --- Sequence stop: any manual stick input always cancels
         # immediately (never fights a human input, same rule as
