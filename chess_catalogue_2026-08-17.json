@@ -1,0 +1,171 @@
+{
+  "generated": "2026-08-17 (real powered-move catalogue - actual captured raw values, not solved/interpolated)",
+  "note": "Direct captures of real powered Triangle-driven positions. No modeling/extrapolation. Use these raw_nodes directly to drive to a catalogued square without live-solving.",
+  "squares": {
+    "a1": {
+      "raw_nodes": {
+        "node0": -4.17055,
+        "node1": -3.17657,
+        "node3": -7e-05,
+        "node4": 5.82791,
+        "node5": 3.14814,
+        "node6": -3.14164
+      },
+      "achieved_xyz": [
+        -0.0654,
+        0.2253,
+        0.2325
+      ]
+    },
+    "h1": {
+      "raw_nodes": {
+        "node0": -2.04315,
+        "node1": -3.1767,
+        "node3": 0.00025,
+        "node4": 5.83115,
+        "node5": 3.14749,
+        "node6": -3.14175
+      },
+      "achieved_xyz": [
+        0.2186,
+        0.0837,
+        0.2318
+      ]
+    },
+    "c2": {
+      "raw_nodes": {
+        "node0": -3.52147,
+        "node1": -3.22246,
+        "node3": -0.00013,
+        "node4": 5.86767,
+        "node5": 3.14918,
+        "node6": -3.14274
+      },
+      "achieved_xyz": [
+        0.0386,
+        0.2245,
+        0.2313
+      ]
+    },
+    "e3": {
+      "raw_nodes": {
+        "node0": -2.98323,
+        "node1": -2.9958,
+        "node3": 7e-05,
+        "node4": 5.66518,
+        "node5": 3.11172,
+        "node6": -3.1067
+      },
+      "achieved_xyz": [
+        0.1398,
+        0.2264,
+        0.2359
+      ]
+    },
+    "g4": {
+      "raw_nodes": {
+        "node0": -2.60395,
+        "node1": -2.69389,
+        "node3": 3e-05,
+        "node4": 5.33335,
+        "node5": 3.00753,
+        "node6": -3.00059
+      },
+      "achieved_xyz": [
+        0.246,
+        0.2268,
+        0.2456
+      ]
+    },
+    "b4": {
+      "raw_nodes": {
+        "node0": -3.60943,
+        "node1": -2.67161,
+        "node3": -2e-05,
+        "node4": 5.3107,
+        "node5": 3.0075,
+        "node6": -3.00087
+      },
+      "achieved_xyz": [
+        0.0417,
+        0.336,
+        0.2455
+      ]
+    },
+    "a7": {
+      "raw_nodes": {
+        "node0": -3.58685,
+        "node1": -1.81091,
+        "node3": -8e-05,
+        "node4": 4.11435,
+        "node5": 3.29124,
+        "node6": -3.28645
+      },
+      "achieved_xyz": [
+        0.0738,
+        0.4918,
+        0.27
+      ]
+    },
+    "g7": {
+      "raw_nodes": {
+        "node0": -2.73579,
+        "node1": -1.88492,
+        "node3": -6e-05,
+        "node4": 4.23032,
+        "node5": 3.29272,
+        "node6": -3.28743
+      },
+      "achieved_xyz": [
+        0.3261,
+        0.3548,
+        0.2681
+      ]
+    },
+    "e6": {
+      "raw_nodes": {
+        "node0": -3.03441,
+        "node1": -2.29907,
+        "node3": -0.0002,
+        "node4": 4.82491,
+        "node5": 3.03478,
+        "node6": -3.02879
+      },
+      "achieved_xyz": [
+        0.2118,
+        0.3606,
+        0.2595
+      ]
+    },
+    "e8": {
+      "raw_nodes": {
+        "node0": -3.04541,
+        "node1": -1.55606,
+        "node3": -0.00018,
+        "node4": 3.68784,
+        "node5": 3.58958,
+        "node6": -3.58213
+      },
+      "achieved_xyz": [
+        0.2606,
+        0.4466,
+        0.2778
+      ]
+    },
+    "c5": {
+      "raw_nodes": {
+        "node0": -3.37093,
+        "node1": -2.43956,
+        "node3": -4e-05,
+        "node4": 5.01874,
+        "node5": 3.15492,
+        "node6": -3.14776
+      },
+      "achieved_xyz": [
+        0.1082,
+        0.3585,
+        0.2542
+      ]
+    }
+  }
+}
