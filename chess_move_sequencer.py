@@ -40,7 +40,7 @@ import urllib.request
 
 CALIBRATION_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    'chess_board_calibration_2026-08-20_48mmRoll.json',
+    'chess_board_calibration_2026-09-09_4corner.json',
 )
 IK_TARGET_FILE = os.path.expanduser('~/dARM/odrive_tools/ik_target.json')
 LOG_FILE = os.path.expanduser('~/dARM/odrive_tools/chess_move_log.jsonl')
