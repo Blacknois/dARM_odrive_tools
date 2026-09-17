@@ -47,6 +47,27 @@ PS_BUTTON_INDEX         = 10    # PS button
 # DEAD_MAN_BUTTON_INDEX) is a plain button with no such quirk.
 ARM_HOLD_SECONDS        = 1.5
 DISARM_HOLD_SECONDS     = 1.0
+# --- Thermal guard (2026-09-15). Node 2's motor reached 90 C after ~10 min
+# held at full extension; the only warning was the smell. The S1s have no
+# motor thermistor, so the driver-board (FET) temperature is the proxy: the
+# board read 61 C while the motor was at 90, and it lags the winding by
+# minutes - hence conservative numbers. WARN puts it on the status line;
+# RETURN starts the SAME staged safe-return + disarm that PS-tap runs.
+FET_TEMP_WARN_C         = 42.0   # idle boards read 28-32 C (node 2 idles warmest)
+FET_TEMP_RETURN_C       = 50.0   # Carla 2026-09-15: the printed structure starts to soften near 60; go home well before
+# --- Shoulder balance (2026-09-15). Nodes 1 and 2 drive one joint; each
+# controller's integrator pushes until ITS encoder is on target, only one can
+# be, so the other winds up: node 2 carried 3-5x node 1's current all day and
+# hit 90 C. 'e' = torque_1 + torque_2 is zero when they share equally; a
+# slow nudge of node 2's target drives e to zero. Clamped hard: the offset
+# can never exceed BALANCE_MAX raw (~2 deg of joint).
+BALANCE_GAIN            = 0.008  # raw per Nm per update (0.3 s). 0.003 lost a race with a park-stop wind-up 2026-09-15 15:03; 0.015 raw removed 0.5 Nm, so this corrects ~30%/step
+BALANCE_MAX             = 0.05   # raw, absolute clamp on the offset (~2 deg of joint; 0.02 first test hit the clamp over the board 2026-09-15)
+BALANCE_DEADBAND_NM     = 0.03   # ignore imbalance smaller than this
+BALANCE_DIVERGE_STEPS   = 5      # |e| growing this many nudges in a row AND ...
+BALANCE_DIVERGE_MIN_OFF = 0.010  # ... the offset has moved at least this far from where the episode began = wrong sign.
+                                 # 2026-09-15 15:03: the guard fired on a park-stop wind-up that was growing on its
+                                 # own, with the offset still near zero, and disabled the fix when it was needed.
 
 # IK-mode trigger (2026-08-13, first version). Triangle - unused by
 # anything else (RB is already wrist_mode, L1+Circle is arming).
@@ -107,7 +128,7 @@ IK_ARRIVAL_TOLERANCE    = 0.08  # same units as joint_positions/shoulder_ctrl.va
                                  # successful run 2026-08-13 -> tightened here to 0.08,
                                  # still safely above the noise floor but closer than
                                  # 0.15's margin, per DrJones's own call while testing live.
-IK_SERVICE_URL          = "http://192.168.1.119:8901/solve"
+IK_SERVICE_URL          = "http://pi4Gb.local:8901/solve"  # 2026-09-14: by mDNS name - redPi moved to Wi-Fi (.116), was .119 wired; the name follows it
 # Overall hard timeout - covers BOTH failure modes with one backstop: a
 # target that's valid per the IK service's own bounds check but not
 # actually reachable within this script's real hand-measured limits
@@ -581,6 +602,13 @@ def ik_request_worker(x, y, z, result_holder):
 
 stop_event = threading.Event()
 
+# Latest driver-board temperature per node, filled in by the metrics display
+# thread (which already reads it for the dashboard) and only READ by the main
+# loop's thermal guard. The display thread still never moves, arms or disarms.
+fet_temps = {}
+node_torque = {}   # latest torque_estimate per node, same source, read by the shoulder balance
+node_armed = {}    # latest axis0.is_armed per node, same source - ESC refuses to exit while any is True
+
 # Joystick states for UI display
 joystick_states = {
     "LB": False,
@@ -647,6 +675,16 @@ def signal_handler(sig, frame):
 
 def handle_input(key, loop, node_ids, bus, joint_positions):
     if key == 'esc':
+        # 2026-09-15: ESC exited the main loop while the arm was ARMED over the
+        # board (a stray arrow-key sequence carries an ESC). The exit path then
+        # ran the safe-return with NO controller input - PS-hold could not stop
+        # it, and a Ctrl-C killed the process while the drives carried on with
+        # the last trajectory. Only the power switch worked. Never again: while
+        # any node is armed, ESC does nothing but say so. Disarm with PS first.
+        if any(node_armed.values()):
+            joystick_states["status"] = "ESC IGNORED - arm is ARMED. Disarm with PS first, then ESC."
+            print("[SAFETY] ESC ignored: nodes still armed. Disarm (PS) before exiting.")
+            return
         stop_event.set()
         raise urwid.ExitMainLoop()
 
@@ -1241,11 +1279,12 @@ class ShoulderController:
         self.bus      = bus
         self.node_ids = node_ids
         self.value    = 0.0
+        self.balance  = 0.0   # 2026-09-15: node 2 offset from the shoulder balance, clamped +/-BALANCE_MAX
 
     def apply(self):
         nA, nB = self.node_ids
         motorA = self.value
-        motorB = -self.value
+        motorB = -self.value + self.balance
         move_odrive_to_position(self.bus, nA, motorA)
         move_odrive_to_position(self.bus, nB, motorB)
 
@@ -1294,6 +1333,15 @@ def update_ui_thread(bus, node_ids, endpoints, metrics_text, joystick_text, loop
         lines = [header]
         for nid in node_ids:
             data = get_metrics(bus, nid, endpoints)
+            _t = data.get("fet (C)")
+            if isinstance(_t, (int, float)):
+                fet_temps[nid] = float(_t)   # thermal guard input - see FET_TEMP_WARN_C
+            _q = data.get("tor (Nm)")
+            if isinstance(_q, (int, float)):
+                node_torque[nid] = float(_q)
+            _a = data.get("armed")
+            if isinstance(_a, (int, float, bool)):
+                node_armed[nid] = bool(_a)
             row = f"{nid:<{node_col_w}}"
             for metric in METRIC_ENDPOINTS:
                 val = data.get(metric, None)
@@ -1393,7 +1441,15 @@ def joystick_thread_func(
     pick_place_solve_result = {}
     pick_place_solve_hover  = None  # captured hover raw_nodes, held across the async wait
     pick_place_solve_grip   = None  # captured grip_val, held across the async wait
-    ps_prev               = False
+    ps_prev = False
+    thermal_return_fired = False   # thermal guard: one safe-return per over-temperature episode
+    thermal_last_print = 0.0
+    balance_last_update = 0.0   # shoulder balance rate limiter
+    balance_last_print = 0.0
+    balance_disabled = False    # set by the divergence guard
+    balance_episode_offset = 0.0   # offset when the imbalance last stopped growing
+    balance_grow_count = 0
+    balance_last_abs_e = 0.0
     ps_press_time         = None
     all_armed             = False
     was_seq_running        = False
@@ -1603,6 +1659,71 @@ def joystick_thread_func(
         else:
             ps_press_time = None
         ps_prev = ps
+
+        # --- Thermal guard (2026-09-15): driver-board temperature from the
+        # dashboard thread. WARN -> status line (only when idle, so it never
+        # hides an IK/sequence status). RETURN -> the same safe-return start
+        # as a PS tap, once per over-temperature episode; the loop below
+        # already ignores other input while the sequence runs and the
+        # sequence ends with a verified disarm.
+        _hot = {n: t for n, t in fet_temps.items() if t >= FET_TEMP_WARN_C}
+        if _hot:
+            _worst = max(_hot, key=_hot.get)
+            if (_hot[_worst] >= FET_TEMP_RETURN_C and all_armed
+                    and not safe_return.is_running() and not thermal_return_fired):
+                armed_ep = endpoints['endpoints']['axis0.is_armed']
+                armed_ids = [nid for nid in node_ids
+                             if read_config(bus, nid, armed_ep['id'], armed_ep['type'])]
+                print(f"\n>>> THERMAL: node {_worst} driver board {_hot[_worst]:.0f} C >= {FET_TEMP_RETURN_C:.0f} - SAFE RETURN + DISARM for {armed_ids} <<<\n")
+                joystick_states["status"] = f"THERMAL {_hot[_worst]:.0f}C node {_worst}: SAFE RETURN running (all other input ignored)"
+                safe_return.start(bus, armed_ids, endpoints, shoulder_ctrl, wrist_ctrl, joint_positions)
+                thermal_return_fired = True
+            elif (not safe_return.is_running() and not ik_mode_active and not sequence_active):
+                joystick_states["status"] = f"THERMAL WARNING: node {_worst} driver board {_hot[_worst]:.0f} C (return at {FET_TEMP_RETURN_C:.0f})"
+            if time.time() - thermal_last_print > 10.0:
+                thermal_last_print = time.time()
+                print(f"\a[THERMAL] hot nodes: " + ", ".join(f"node {n} {t:.0f}C" for n, t in sorted(_hot.items())))
+        else:
+            thermal_return_fired = False
+        if not all_armed:
+            thermal_return_fired = False   # re-arming while still hot must trigger the return again
+            if balance_disabled:
+                balance_disabled = False; balance_grow_count = 0   # a divergence disable lasts one arming, not the session
+                print("[BALANCE] re-enabled for the next arming")
+
+        # --- Shoulder balance (2026-09-15): see BALANCE_GAIN. Only while fully
+        # armed and idle (no safe-return, no arming, no IK move, no sequence);
+        # re-sends the shoulder targets only when the offset actually changed.
+        if (all_armed and shoulder_ctrl and 1 in node_torque and 2 in node_torque
+                and not safe_return.is_running() and not arming_seq.is_running()
+                and not ik_mode_active and not sequence_active
+                and time.time() - balance_last_update >= 0.3):
+            balance_last_update = time.time()
+            _e = node_torque[1] + node_torque[2]
+            if abs(_e) > BALANCE_DEADBAND_NM and not balance_disabled:
+                # divergence guard: if the imbalance has GROWN for
+                # BALANCE_DIVERGE_STEPS nudges in a row the sign is wrong -
+                # put the offset back to zero and stop for this session.
+                if abs(_e) > balance_last_abs_e + 0.005:
+                    balance_grow_count += 1
+                else:
+                    balance_grow_count = 0
+                    balance_episode_offset = shoulder_ctrl.balance   # imbalance not growing: re-anchor
+                balance_last_abs_e = abs(_e)
+                if (balance_grow_count >= BALANCE_DIVERGE_STEPS
+                        and abs(shoulder_ctrl.balance - balance_episode_offset) >= BALANCE_DIVERGE_MIN_OFF):
+                    balance_disabled = True
+                    shoulder_ctrl.balance = 0.0
+                    shoulder_ctrl.apply()
+                    print("[BALANCE] imbalance growing under correction - offset reset to 0, balance DISABLED for this session (sign?)")
+                else:
+                    _new = max(-BALANCE_MAX, min(BALANCE_MAX, shoulder_ctrl.balance - BALANCE_GAIN * _e))
+                    if _new != shoulder_ctrl.balance:
+                        shoulder_ctrl.balance = _new
+                        shoulder_ctrl.apply()
+            if time.time() - balance_last_print >= 2.0:
+                balance_last_print = time.time()
+                print(f"[BALANCE] t1 {node_torque[1]:+.2f} t2 {node_torque[2]:+.2f} e {_e:+.2f} Nm  offset {shoulder_ctrl.balance:+.4f} raw")
 
         # --- Resync all_armed once the safe-return sequence stops running
         # (finished normally, disarming everyone in its own last stage, or
@@ -1860,7 +1981,14 @@ def joystick_thread_func(
             # BUTTON_INDEX comment above for why).
             all_arrived = True
             use_tight_tol = ik_mode_is_catalogued and not ik_catalogue_staging
-            arrival_tol = CATALOGUE_ARRIVAL_TOLERANCE if use_tight_tol else IK_ARRIVAL_TOLERANCE
+            # 2026-09-13: measured live (h8 hover) that a one-off IK move
+            # stopped with n1/n4 at 0.0799/-0.0792 - a hair inside 0.08 -
+            # for a 19 mm miss. This check compares the software SETPOINT
+            # to the target (never a live read), so encoder creep cannot
+            # make it chatter; the catalogue path has run at 0.02 through
+            # this same block since 2026-08-17. Only the catalogue STAGING
+            # leg (a rough waypoint) keeps the loose tolerance now.
+            arrival_tol = IK_ARRIVAL_TOLERANCE if ik_catalogue_staging else CATALOGUE_ARRIVAL_TOLERANCE
             settle_tol  = CATALOGUE_SETTLE_TOLERANCE  if use_tight_tol else IK_SETTLE_TOLERANCE
 
             # Smooth ramp from 0 to IK_VELOCITY_SCALING over IK_RAMP_UP_

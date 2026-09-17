@@ -14,7 +14,8 @@ METRIC_ENDPOINTS = {
     "mech_pwr (W)":  "axis0.motor.mechanical_power", 
     "elec_pwr (W)":  "axis0.motor.electrical_power", 
     "armed":         "axis0.is_armed",               
-    "disarm_msg":    "axis0.disarm_reason"
+    "disarm_msg":    "axis0.disarm_reason",
+    "fet (C)":       "axis0.motor.fet_thermistor.temperature"   # 2026-09-15: driver-board temperature (no motor thermistor is wired)
 }
 
 def get_metrics(bus, node_id, endpoints):
