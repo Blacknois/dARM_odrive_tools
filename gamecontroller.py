@@ -2006,7 +2006,14 @@ def joystick_thread_func(
                 # triggered START would immediately also trigger STOP
                 # the instant ik_mode_active flips True.
                 ik_triangle_released_since_start = False
-                joystick_states["status"] = f"IK MODE: moving to {IK_TEST_TARGET_XYZ}"
+                # 2026-09-25: this used to interpolate the CONSTANT
+                # IK_TEST_TARGET_XYZ, so every IK move ever made announced
+                # "moving to (0.4, 0.2, 0.3)" - a point on the OPPOSITE side of
+                # the robot from the board - regardless of where it was really
+                # going. Alarming when read during a board move, and a status
+                # line that always cries wolf gets ignored the day it matters.
+                _tgt = solve.get("target")
+                joystick_states["status"] = ("IK MODE: moving to (%.4f, %.4f, %.4f)" % tuple(_tgt)) if _tgt else "IK MODE: moving to target"
                 print(f"[IK] Target acquired: {ik_targets}")
             else:
                 err = ik_request_result.get('error') or solve
