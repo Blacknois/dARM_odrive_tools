@@ -53,8 +53,12 @@ DISARM_HOLD_SECONDS     = 1.0
 # board read 61 C while the motor was at 90, and it lags the winding by
 # minutes - hence conservative numbers. WARN puts it on the status line;
 # RETURN starts the SAME staged safe-return + disarm that PS-tap runs.
-FET_TEMP_WARN_C         = 42.0   # idle boards read 28-32 C (node 2 idles warmest)
-FET_TEMP_RETURN_C       = 50.0   # Carla 2026-09-15: the printed structure starts to soften near 60; go home well before
+FET_TEMP_WARN_C         = 50.0   # idle boards read 28-32 C (node 2 idles warmest). 2026-09-25: 42 -> 50, Carla: "50 C is no problem"
+FET_TEMP_RETURN_C       = 55.0   # Carla 2026-09-15: the printed structure starts to soften near 60; go home well before.
+# 2026-09-25: 50 -> 55, not the 60 first suggested. This is where the staged return BEGINS and it takes up to 30 s of
+# further work to fold home, so the real peak lands above the number; 55 lets the return COMPLETE by ~60 rather than
+# start there. Remember the board is not the motor: the S1s have no motor thermistor and on 2026-09-15 a board at 61 C
+# went with a motor at 90 C. Board temp lags the winding badly.
 # --- Shoulder balance (2026-09-15). Nodes 1 and 2 drive one joint; each
 # controller's integrator pushes until ITS encoder is on target, only one can
 # be, so the other winds up: node 2 carried 3-5x node 1's current all day and
@@ -167,6 +171,59 @@ IK_TEST_TARGET_XYZ      = (0.4, 0.2, 0.3)
 # keys) - a stale/bad file can never crash this loop or silently do
 # something unexpected, it just behaves exactly as before this change.
 IK_TARGET_FILE = os.path.expanduser('~/dARM/odrive_tools/ik_target.json')
+
+IK_LEGS_MAX      = 12      # 2026-09-25: cap on a one-press sequence
+IK_LEGS_MIN_Z    = -0.150  # no leg may command below this (lowest touch height is -0.138)
+
+
+def read_ik_legs():
+    """2026-09-25: optional "legs" list in ik_target.json - a sequence of
+    waypoints run on ONE Triangle press, generalising via_z (which adds a
+    single waypoint) to N. Returns [(x, y, z, grip_or_None), ...] or [].
+
+    Same defensive contract as read_ik_target(): ANY problem returns [] and
+    the caller behaves exactly as before this change. A malformed list is
+    rejected WHOLE, never partially executed. Rejects more than IK_LEGS_MAX
+    legs, a non-numeric field, or any leg below IK_LEGS_MIN_Z - a bad list
+    must not be able to drive the fingers into the board.
+    """
+    try:
+        with open(IK_TARGET_FILE) as f:
+            data = json.load(f)
+        legs = data.get("legs")
+        if not legs or not isinstance(legs, list):
+            return []
+        if len(legs) > IK_LEGS_MAX:
+            print("[IK] legs rejected: %d legs, max is %d" % (len(legs), IK_LEGS_MAX))
+            return []
+        out = []
+        for leg in legs:
+            x, y, z = float(leg["x"]), float(leg["y"]), float(leg["z"])
+            if z < IK_LEGS_MIN_Z:
+                print("[IK] legs rejected: leg z=%.4f is below IK_LEGS_MIN_Z %.3f" % (z, IK_LEGS_MIN_Z))
+                return []
+            g = leg.get("grip")
+            out.append((x, y, z, None if g is None else float(g)))
+        return out
+    except Exception as e:
+        print("[IK] legs ignored (%s)" % e)
+        return []
+
+
+
+def read_via_z():
+    """2026-09-18: optional 'via_z' in ik_target.json. When present, a one-off
+    IK move first goes to (x, y, via_z) - the target's x/y at a safe height,
+    above any piece - and only then descends to (x, y, z). The arm went
+    straight through a piece on a direct move this morning. Absent = the
+    old direct move, unchanged."""
+    try:
+        with open(IK_TARGET_FILE) as f:
+            data = json.load(f)
+        return float(data['via_z']) if 'via_z' in data else None
+    except Exception:
+        return None
+
 
 def read_ik_target():
     try:
@@ -1465,6 +1522,8 @@ def joystick_thread_func(
     ik_catalogue_staging = False   # True only during the first (staging) leg
                                     # of a catalogued move - see
                                     # CATALOGUE_STAGING_TARGET above.
+    ik_via_final_xyz = None   # 2026-09-18: (x, y, z, grip) to solve AFTER the via leg settles; None = no via leg
+    ik_leg_queue = []         # 2026-09-25: remaining (x,y,z,grip) waypoints of a one-press sequence
     ik_catalogue_final_target = None  # holds the real catalogued target while
                                        # ik_targets points at the staging pose
     ik_catalogue_square_name = None   # which square, for replay-accuracy logging only
@@ -1646,6 +1705,8 @@ def joystick_thread_func(
                 ik_mode_is_catalogued = False
                 ik_catalogue_staging = False
                 ik_catalogue_final_target = None
+                ik_via_final_xyz = None
+                ik_leg_queue = []
                 ik_targets = None
                 ik_pending_grip = None
                 ik_request_thread = None  # discard any in-flight request - see 2026-08-13 note below
@@ -1748,6 +1809,8 @@ def joystick_thread_func(
             ik_mode_is_catalogued = False
             ik_catalogue_staging = False
             ik_catalogue_final_target = None
+            ik_via_final_xyz = None
+            ik_leg_queue = []
             ik_targets = None
             ik_pending_grip = None
             ik_request_thread = None
@@ -1796,6 +1859,8 @@ def joystick_thread_func(
                     ik_mode_is_catalogued = False
                     ik_catalogue_staging = False
                     ik_catalogue_final_target = None
+                    ik_via_final_xyz = None
+                    ik_leg_queue = []
                     ik_targets = None
                     ik_pending_grip = None
                     ik_request_thread = None
@@ -1881,13 +1946,33 @@ def joystick_thread_func(
                     ik_mode_is_catalogued = False
                     ik_catalogue_staging = False
                     ik_catalogue_final_target = None
+                    ik_via_final_xyz = None
+                    ik_leg_queue = []
                     x, y, z, ik_pending_grip = read_ik_target()
+                    # 2026-09-25: a multi-leg sequence takes precedence over via_z; one
+                    # Triangle press then walks the whole list, settling between legs.
+                    ik_leg_queue = read_ik_legs()
+                    via_z = None
+                    if ik_leg_queue:
+                        x, y, z, ik_pending_grip = ik_leg_queue.pop(0)
+                        print("[IK] leg sequence: %d legs, first (%.4f, %.4f, %.4f)" % (len(ik_leg_queue) + 1, x, y, z))
+                    else:
+                        via_z = read_via_z()
+                    if via_z is not None and via_z > z:
+                        # via leg first: same x/y at the safe height; the real
+                        # target is solved once the via leg has settled
+                        ik_via_final_xyz = (x, y, z, ik_pending_grip)
+                        ik_pending_grip = None
+                        z = via_z
+                        print(f"[IK] via leg: going to ({x:.4f}, {y:.4f}, {via_z:.4f}) first, then down to z={ik_via_final_xyz[2]:.4f}")
+                    else:
+                        ik_via_final_xyz = None
                     ik_request_result = {}
                     ik_request_thread = threading.Thread(
                         target=ik_request_worker, args=(x, y, z, ik_request_result), daemon=True
                     )
                     ik_request_thread.start()
-                    joystick_states["status"] = "IK MODE: requesting target..."
+                    joystick_states["status"] = "IK MODE: requesting target..." + (" (via leg)" if ik_via_final_xyz else "")
                 ik_hold_start = None
         elif ik_request_thread is None:
             ik_hold_start = None
@@ -1942,6 +2027,8 @@ def joystick_thread_func(
             ik_mode_is_catalogued = False
             ik_catalogue_staging = False
             ik_catalogue_final_target = None
+            ik_via_final_xyz = None
+            ik_leg_queue = []
             ik_targets = None
             ik_pending_grip = None
             joystick_states["status"] = "IK MODE: stopped (Triangle pressed)"
@@ -1951,6 +2038,8 @@ def joystick_thread_func(
             ik_mode_is_catalogued = False
             ik_catalogue_staging = False
             ik_catalogue_final_target = None
+            ik_via_final_xyz = None
+            ik_leg_queue = []
             ik_targets = None
             ik_pending_grip = None
             joystick_states["status"] = "IK MODE: cancelled (manual input detected)"
@@ -1967,6 +2056,8 @@ def joystick_thread_func(
             ik_mode_is_catalogued = False
             ik_catalogue_staging = False
             ik_catalogue_final_target = None
+            ik_via_final_xyz = None
+            ik_leg_queue = []
             ik_targets = None
             ik_pending_grip = None
             joystick_states["status"] = "IK MODE: timed out - did not reach target in time"
@@ -1988,7 +2079,7 @@ def joystick_thread_func(
             # make it chatter; the catalogue path has run at 0.02 through
             # this same block since 2026-08-17. Only the catalogue STAGING
             # leg (a rough waypoint) keeps the loose tolerance now.
-            arrival_tol = IK_ARRIVAL_TOLERANCE if ik_catalogue_staging else CATALOGUE_ARRIVAL_TOLERANCE
+            arrival_tol = IK_ARRIVAL_TOLERANCE if (ik_catalogue_staging or ik_via_final_xyz is not None or ik_leg_queue) else CATALOGUE_ARRIVAL_TOLERANCE   # via leg = waypoint
             settle_tol  = CATALOGUE_SETTLE_TOLERANCE  if use_tight_tol else IK_SETTLE_TOLERANCE
 
             # Smooth ramp from 0 to IK_VELOCITY_SCALING over IK_RAMP_UP_
@@ -2184,10 +2275,45 @@ def joystick_thread_func(
                         ik_catalogue_staging = False
                         ik_targets = ik_catalogue_final_target
                         ik_catalogue_final_target = None
+                        ik_via_final_xyz = None
+                        ik_leg_queue = []
                         ik_start_time = time.time()  # fresh IK_TIMEOUT_SECONDS budget for this leg
                         ik_commanded_reached_time = None
                         joystick_states["status"] = "IK MODE: staged, now approaching catalogued target"
                         print(f"[IK] Staging leg settled - approaching final catalogued target: {ik_targets}")
+                    elif settled and ik_leg_queue and ik_request_thread is None:
+                        # 2026-09-25: next waypoint of a one-press sequence. Same path as
+                        # the via leg below - ik_mode_active stays True so nothing else
+                        # moves, and a release-then-press of Triangle still stops it.
+                        fx, fy, fz, fgrip = ik_leg_queue.pop(0)
+                        ik_pending_grip = fgrip
+                        ik_request_result = {}
+                        ik_request_thread = threading.Thread(
+                            target=ik_request_worker, args=(fx, fy, fz, ik_request_result), daemon=True
+                        )
+                        ik_request_thread.start()
+                        ik_start_time = time.time()
+                        ik_commanded_reached_time = None
+                        joystick_states["status"] = "IK MODE: leg settled - %d leg(s) left" % len(ik_leg_queue)
+                        print("[IK] leg settled - next (%.4f, %.4f, %.4f), %d after this" % (fx, fy, fz, len(ik_leg_queue)))
+                    elif settled and ik_via_final_xyz is not None and ik_request_thread is None:
+                        # Via leg settled - now solve and drive the real target
+                        # (straight down, same x/y). Same background request
+                        # path as the first leg; ik_mode_active stays True so
+                        # nothing else moves meanwhile.
+                        fx, fy, fz, fgrip = ik_via_final_xyz
+                        ik_via_final_xyz = None
+                        ik_leg_queue = []
+                        ik_pending_grip = fgrip
+                        ik_request_result = {}
+                        ik_request_thread = threading.Thread(
+                            target=ik_request_worker, args=(fx, fy, fz, ik_request_result), daemon=True
+                        )
+                        ik_request_thread.start()
+                        ik_start_time = time.time()
+                        ik_commanded_reached_time = None
+                        joystick_states["status"] = "IK MODE: via leg settled - descending to target"
+                        print(f"[IK] Via leg settled - requesting final target ({fx:.4f}, {fy:.4f}, {fz:.4f})")
                     elif settled:
                         if use_tight_tol:
                             # Catalogue-replay accuracy log - local file
