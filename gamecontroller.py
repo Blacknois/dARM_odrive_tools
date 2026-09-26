@@ -203,7 +203,14 @@ def read_ik_legs():
                 print("[IK] legs rejected: leg z=%.4f is below IK_LEGS_MIN_Z %.3f" % (z, IK_LEGS_MIN_Z))
                 return []
             g = leg.get("grip")
-            out.append((x, y, z, None if g is None else float(g)))
+            # 2026-09-26: tolerance is per leg and defaults to TIGHT. The first
+            # version gave every leg but the last the LOOSE via-waypoint
+            # tolerance (0.08 raw, ~28 mm at board reach); the descent and grip
+            # legs then "settled" 13.5 mm high and 24.7 mm sideways and the
+            # pick missed the piece. Accuracy must be the default - a forgotten
+            # flag should cost time, never precision. Mark genuine fly-through
+            # waypoints with "loose": true.
+            out.append((x, y, z, None if g is None else float(g), bool(leg.get("loose", False))))
         return out
     except Exception as e:
         print("[IK] legs ignored (%s)" % e)
@@ -622,6 +629,16 @@ DECEL_ZONE_WRIST_BEND   = 0.45  # 2026-08-16: shrunk (not removed) per explicit 
 DECEL_ZONE_WRIST_ROTATE = 1.5   # 2026-08-16: same reasoning as bend above. Roughly half the previous 3.08 (15% of span).
 MIN_WRIST_IK_STEP = 0.01  # 2026-08-16: real live-observed bug - on an IK-mode retry with a small remaining diff, `step = diff * ik_speed * dt` shrinks proportionally with no floor, and got small enough that the wrist barely moved at all (suspected: too small to reliably overcome real motor cogging/static friction). This floors the wrist's commanded step magnitude (never the direction/sign) so a retry always produces a command big enough to actually move the motor. Deliberately kept smaller than IK_ARRIVAL_TOLERANCE (0.08) to avoid overshoot. Wrist-only - node0/3/4's step formulas are untouched.
 DECEL_ZONE_GRIPPER = 0.08  # 2026-08-17: was 0.2, compressed - more of the range at full speed
+# 2026-09-26: the gripper was the SLOWEST joint in an IK move by a wide margin -
+# 36 s to travel 0.4 raw while the arm finished several legs, so a commanded
+# grip was still in flight legs later. Cause: the step formula divides by
+# TARGET_ARRIVAL_DECEL_ZONE (0.8), which is a small slice of an arm joint's
+# range but nearly the gripper's ENTIRE travel (TRIGGER_MIN..MAX = 0.936), so a
+# typical 0.4 raw grip started at half speed and decelerated from there. This
+# gives node7 its own, smaller divisor: it reaches full speed sooner.
+# 0.8 -> 0.6 is Carla's requested ~30%. Raise further only with care - the
+# gripper closing faster means it closes harder on a piece.
+GRIPPER_IK_DECEL_ZONE = 0.6
 
 def taper_increment(current_val, increment, min_val, max_val, decel_zone):
     """
@@ -1523,7 +1540,9 @@ def joystick_thread_func(
                                     # of a catalogued move - see
                                     # CATALOGUE_STAGING_TARGET above.
     ik_via_final_xyz = None   # 2026-09-18: (x, y, z, grip) to solve AFTER the via leg settles; None = no via leg
-    ik_leg_queue = []         # 2026-09-25: remaining (x,y,z,grip) waypoints of a one-press sequence
+    ik_leg_queue = []         # 2026-09-25: remaining (x,y,z,grip,loose) waypoints of a one-press sequence
+    ik_leg_loose = False      # 2026-09-26: is the leg being flown a fly-through waypoint?
+    ik_last_grip = None       # 2026-09-26: last commanded node7, carried across legs
     ik_catalogue_final_target = None  # holds the real catalogued target while
                                        # ik_targets points at the staging pose
     ik_catalogue_square_name = None   # which square, for replay-accuracy logging only
@@ -1952,9 +1971,10 @@ def joystick_thread_func(
                     # 2026-09-25: a multi-leg sequence takes precedence over via_z; one
                     # Triangle press then walks the whole list, settling between legs.
                     ik_leg_queue = read_ik_legs()
+                    ik_last_grip = None
                     via_z = None
                     if ik_leg_queue:
-                        x, y, z, ik_pending_grip = ik_leg_queue.pop(0)
+                        x, y, z, ik_pending_grip, ik_leg_loose = ik_leg_queue.pop(0)
                         print("[IK] leg sequence: %d legs, first (%.4f, %.4f, %.4f)" % (len(ik_leg_queue) + 1, x, y, z))
                     else:
                         via_z = read_via_z()
@@ -1992,8 +2012,17 @@ def joystick_thread_func(
                 try:
                     raw = solve["raw_nodes"]
                     ik_targets = {0: raw["node0"], 1: raw["node1"], 3: raw["node3"], 4: raw["node4"], 5: raw["node5"], 6: raw["node6"]}
+                    # 2026-09-26: ik_targets is REBUILT on every solve, and node7
+                    # used to be re-added only when that leg carried a grip. A
+                    # later leg without one therefore dropped node7 from the
+                    # targets mid-travel and abandoned the gripper wherever it
+                    # had got to - the place leg commanded open, the next leg
+                    # wiped it, and the piece was never released. Remember the
+                    # last commanded grip and keep driving it until changed.
                     if ik_pending_grip is not None:
-                        ik_targets[7] = ik_pending_grip
+                        ik_last_grip = ik_pending_grip
+                    if ik_last_grip is not None:
+                        ik_targets[7] = ik_last_grip
                     parsed_ok = True
                 except Exception as e:
                     solve = {"parse_error": str(e)}
@@ -2086,7 +2115,8 @@ def joystick_thread_func(
             # make it chatter; the catalogue path has run at 0.02 through
             # this same block since 2026-08-17. Only the catalogue STAGING
             # leg (a rough waypoint) keeps the loose tolerance now.
-            arrival_tol = IK_ARRIVAL_TOLERANCE if (ik_catalogue_staging or ik_via_final_xyz is not None or ik_leg_queue) else CATALOGUE_ARRIVAL_TOLERANCE   # via leg = waypoint
+            # 2026-09-26: a leg is tight unless it asked to be loose (see read_ik_legs)
+            arrival_tol = IK_ARRIVAL_TOLERANCE if (ik_catalogue_staging or ik_via_final_xyz is not None or ik_leg_loose) else CATALOGUE_ARRIVAL_TOLERANCE
             settle_tol  = CATALOGUE_SETTLE_TOLERANCE  if use_tight_tol else IK_SETTLE_TOLERANCE
 
             # Smooth ramp from 0 to IK_VELOCITY_SCALING over IK_RAMP_UP_
@@ -2214,7 +2244,8 @@ def joystick_thread_func(
                 diff = ik_targets[7] - joint_positions[7]
                 if abs(diff) > IK_ARRIVAL_TOLERANCE:
                     all_arrived = False
-                    step = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt
+                    # 2026-09-26: GRIPPER_IK_DECEL_ZONE, not TARGET_ARRIVAL_DECEL_ZONE - see its comment
+                    step = max(-1.0, min(1.0, diff / GRIPPER_IK_DECEL_ZONE)) * ik_speed * dt
                     joint_positions[7] += taper_increment(joint_positions[7], step, TRIGGER_MIN, TRIGGER_MAX, DECEL_ZONE_GRIPPER)
                     if joint_positions[7] < TRIGGER_MIN: joint_positions[7] = TRIGGER_MIN
                     if joint_positions[7] > TRIGGER_MAX: joint_positions[7] = TRIGGER_MAX
@@ -2292,7 +2323,7 @@ def joystick_thread_func(
                         # 2026-09-25: next waypoint of a one-press sequence. Same path as
                         # the via leg below - ik_mode_active stays True so nothing else
                         # moves, and a release-then-press of Triangle still stops it.
-                        fx, fy, fz, fgrip = ik_leg_queue.pop(0)
+                        fx, fy, fz, fgrip, ik_leg_loose = ik_leg_queue.pop(0)
                         ik_pending_grip = fgrip
                         ik_request_result = {}
                         ik_request_thread = threading.Thread(
