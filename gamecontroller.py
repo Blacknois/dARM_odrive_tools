@@ -639,6 +639,18 @@ DECEL_ZONE_GRIPPER = 0.08  # 2026-08-17: was 0.2, compressed - more of the range
 # 0.8 -> 0.6 is Carla's requested ~30%. Raise further only with care - the
 # gripper closing faster means it closes harder on a piece.
 GRIPPER_IK_DECEL_ZONE = 0.6
+# 2026-09-26 PROJECT 2 PHASE A - trajectory synchronisation. Every IK joint
+# used to servo on its own, so they finished at different times: the
+# MIN_WRIST_IK_STEP floor ran the wrist at a flat 0.30 raw/s (0.01 x 30 Hz)
+# while a shoulder covering the same distance took 3x longer (measured in the
+# 09-26 recording) - the tilt transient. Now each frame every moving axis
+# covers the SAME FRACTION of its remaining distance, set by whichever axis
+# is naturally slowest. A straight line in joint space: all start together,
+# all finish together. It only ever SLOWS an axis, never speeds one up, and
+# the slowest axis moves exactly as before, so a move takes no longer.
+# The wrist floor still applies once the wrist is the only thing moving (the
+# small-retry case it was added for). False = exactly the old behaviour.
+IK_SYNC_JOINTS = True
 
 def taper_increment(current_val, increment, min_val, max_val, decel_zone):
     """
@@ -2129,6 +2141,35 @@ def joystick_thread_func(
                 ramp_factor = min(1.0, (time.time() - ik_start_time) / IK_RAMP_UP_SECONDS)
             ik_speed = IK_VELOCITY_SCALING * ramp_factor
 
+            # Phase A sync (see IK_SYNC_JOINTS). An axis's natural step covers
+            # ik_speed*dt / max(|diff|, zone) of its remaining distance, so the
+            # axis with the largest max(|diff|, zone) is the slowest; every
+            # other axis's step is scaled down to match its fraction. Only
+            # axes still outside their arrival tolerance take part.
+            ik_sync = {}
+            if IK_SYNC_JOINTS:
+                sync_axes = []
+                if 0 in node_ids and 0 in ik_targets:
+                    sync_axes.append((0, ik_targets[0] - joint_positions[0], arrival_tol, TARGET_ARRIVAL_DECEL_ZONE))
+                if shoulder_ctrl and (1 in node_ids) and (2 in node_ids) and 1 in ik_targets:
+                    sync_axes.append((1, ik_targets[1] - shoulder_ctrl.value, arrival_tol, TARGET_ARRIVAL_DECEL_ZONE))
+                if 3 in node_ids and 3 in ik_targets:
+                    sync_axes.append((3, ik_targets[3] - joint_positions[3], arrival_tol, TARGET_ARRIVAL_DECEL_ZONE))
+                if 4 in node_ids and 4 in ik_targets:
+                    sync_axes.append((4, ik_targets[4] - joint_positions[4], arrival_tol, TARGET_ARRIVAL_DECEL_ZONE))
+                if wrist_ctrl and 5 in node_ids and 6 in node_ids and 5 in ik_targets and 6 in ik_targets:
+                    sync_axes.append(('bend',   (ik_targets[5] - ik_targets[6]) / 2.0 - wrist_ctrl.bend_pos,   arrival_tol, TARGET_ARRIVAL_DECEL_ZONE))
+                    sync_axes.append(('rotate', (ik_targets[5] + ik_targets[6]) / 2.0 - wrist_ctrl.rotate_pos, arrival_tol, TARGET_ARRIVAL_DECEL_ZONE))
+                if 7 in node_ids and 7 in ik_targets:
+                    sync_axes.append((7, ik_targets[7] - joint_positions[7], IK_ARRIVAL_TOLERANCE, GRIPPER_IK_DECEL_ZONE))
+                effective = {axis: max(abs(diff), zone) for axis, diff, tol, zone in sync_axes if abs(diff) > tol}
+                if effective:
+                    slowest = max(effective.values())
+                    ik_sync = {axis: e / slowest for axis, e in effective.items()}
+            # The wrist step floor would outrun the others, so while synced it
+            # only applies once no non-wrist axis is still moving.
+            wrist_floor_ok = not IK_SYNC_JOINTS or all(axis in ('bend', 'rotate') for axis in ik_sync)
+
             # Diagnostic only - throttled to ~2x/sec so it doesn't spam
             # the log at 30Hz. Added 2026-08-13 after the first live
             # test ended with no visibility into what happened DURING
@@ -2143,13 +2184,14 @@ def joystick_thread_func(
                 if 1 in ik_targets and shoulder_ctrl: dbg['n1'] = round(ik_targets[1] - shoulder_ctrl.value, 4)
                 if 3 in ik_targets: dbg['n3'] = round(ik_targets[3] - joint_positions[3], 4)
                 if 4 in ik_targets: dbg['n4'] = round(ik_targets[4] - joint_positions[4], 4)
-                print(f"[IK][debug] diffs={dbg} ramp={ramp_factor:.2f} speed={ik_speed:.3f} L1={'held' if lb else 'RELEASED'}")
+                sync_dbg = {str(axis): round(s, 2) for axis, s in ik_sync.items()}
+                print(f"[IK][debug] diffs={dbg} sync={sync_dbg} ramp={ramp_factor:.2f} speed={ik_speed:.3f} L1={'held' if lb else 'RELEASED'}")
 
             if 0 in node_ids and 0 in ik_targets:
                 diff = ik_targets[0] - joint_positions[0]
                 if abs(diff) > arrival_tol:
                     all_arrived = False
-                    step = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt
+                    step = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt * ik_sync.get(0, 1.0)
                     joint_positions[0] += taper_increment(joint_positions[0], step, JOINT0_MIN, JOINT0_MAX, DECEL_ZONE)
                     if joint_positions[0] < JOINT0_MIN: joint_positions[0] = JOINT0_MIN
                     if joint_positions[0] > JOINT0_MAX: joint_positions[0] = JOINT0_MAX
@@ -2159,7 +2201,7 @@ def joystick_thread_func(
                 diff = ik_targets[1] - shoulder_ctrl.value
                 if abs(diff) > arrival_tol:
                     all_arrived = False
-                    step = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt
+                    step = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt * ik_sync.get(1, 1.0)
                     new_val = shoulder_ctrl.value + taper_increment(shoulder_ctrl.value, step, JOINT1_MIN, JOINT1_MAX, DECEL_ZONE)
                     if new_val < JOINT1_MIN: new_val = JOINT1_MIN
                     if new_val > JOINT1_MAX: new_val = JOINT1_MAX
@@ -2170,7 +2212,7 @@ def joystick_thread_func(
                 diff = ik_targets[3] - joint_positions[3]
                 if abs(diff) > arrival_tol:
                     all_arrived = False
-                    step = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt
+                    step = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt * ik_sync.get(3, 1.0)
                     joint_positions[3] += taper_increment(joint_positions[3], step, JOINT2_MIN, JOINT2_MAX, DECEL_ZONE)
                     if joint_positions[3] < JOINT2_MIN: joint_positions[3] = JOINT2_MIN
                     if joint_positions[3] > JOINT2_MAX: joint_positions[3] = JOINT2_MAX
@@ -2180,7 +2222,7 @@ def joystick_thread_func(
                 diff = ik_targets[4] - joint_positions[4]
                 if abs(diff) > arrival_tol:
                     all_arrived = False
-                    step = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt
+                    step = max(-1.0, min(1.0, diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt * ik_sync.get(4, 1.0)
                     joint_positions[4] += taper_increment(joint_positions[4], step, JOINT3_MIN, JOINT3_MAX, DECEL_ZONE)
                     if joint_positions[4] < JOINT3_MIN: joint_positions[4] = JOINT3_MIN
                     if joint_positions[4] > JOINT3_MAX: joint_positions[4] = JOINT3_MAX
@@ -2204,16 +2246,16 @@ def joystick_thread_func(
                     rotate_max_dyn = min(ROTATE_MAX, MOTOR5_MAX - wrist_ctrl.bend_pos,   MOTOR6_MAX + wrist_ctrl.bend_pos)
                     rotate_min_dyn = max(ROTATE_MIN, MOTOR5_MIN - wrist_ctrl.bend_pos,   MOTOR6_MIN + wrist_ctrl.bend_pos)
 
-                    bend_step = max(-1.0, min(1.0, bend_diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt
-                    rotate_step = max(-1.0, min(1.0, rotate_diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt
+                    bend_step = max(-1.0, min(1.0, bend_diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt * ik_sync.get('bend', 1.0)
+                    rotate_step = max(-1.0, min(1.0, rotate_diff / TARGET_ARRIVAL_DECEL_ZONE)) * ik_speed * dt * ik_sync.get('rotate', 1.0)
                     # Floor the step magnitude (never the sign/direction),
                     # only for an axis that itself still needs real
                     # movement (its own diff exceeds tolerance) - avoids
                     # nudging an axis that's already individually settled
                     # just because the other axis kept this block active.
-                    if abs(bend_diff) > arrival_tol and 0 < abs(bend_step) < MIN_WRIST_IK_STEP:
+                    if wrist_floor_ok and abs(bend_diff) > arrival_tol and 0 < abs(bend_step) < MIN_WRIST_IK_STEP:
                         bend_step = MIN_WRIST_IK_STEP if bend_step > 0 else -MIN_WRIST_IK_STEP
-                    if abs(rotate_diff) > arrival_tol and 0 < abs(rotate_step) < MIN_WRIST_IK_STEP:
+                    if wrist_floor_ok and abs(rotate_diff) > arrival_tol and 0 < abs(rotate_step) < MIN_WRIST_IK_STEP:
                         rotate_step = MIN_WRIST_IK_STEP if rotate_step > 0 else -MIN_WRIST_IK_STEP
                     new_bend = wrist_ctrl.bend_pos + taper_increment(wrist_ctrl.bend_pos, bend_step, bend_min_dyn, bend_max_dyn, DECEL_ZONE_WRIST_BEND)
                     new_rotate = wrist_ctrl.rotate_pos + taper_increment(wrist_ctrl.rotate_pos, rotate_step, rotate_min_dyn, rotate_max_dyn, DECEL_ZONE_WRIST_ROTATE)
@@ -2245,7 +2287,7 @@ def joystick_thread_func(
                 if abs(diff) > IK_ARRIVAL_TOLERANCE:
                     all_arrived = False
                     # 2026-09-26: GRIPPER_IK_DECEL_ZONE, not TARGET_ARRIVAL_DECEL_ZONE - see its comment
-                    step = max(-1.0, min(1.0, diff / GRIPPER_IK_DECEL_ZONE)) * ik_speed * dt
+                    step = max(-1.0, min(1.0, diff / GRIPPER_IK_DECEL_ZONE)) * ik_speed * dt * ik_sync.get(7, 1.0)
                     joint_positions[7] += taper_increment(joint_positions[7], step, TRIGGER_MIN, TRIGGER_MAX, DECEL_ZONE_GRIPPER)
                     if joint_positions[7] < TRIGGER_MIN: joint_positions[7] = TRIGGER_MIN
                     if joint_positions[7] > TRIGGER_MAX: joint_positions[7] = TRIGGER_MAX
