@@ -139,7 +139,7 @@ IK_SERVICE_URL          = "http://pi4Gb.local:8901/solve"  # 2026-09-14: by mDNS
 # (two independently-maintained limit systems, never cross-validated),
 # and a settle-check that never passes. Either way, give up cleanly by
 # this point rather than running indefinitely.
-IK_TIMEOUT_SECONDS      = 20.0
+IK_TIMEOUT_SECONDS      = 30.0   # 2026-09-29: was 20; first leg from up_safe needs ~18-19 s (Carla approved)
 # Settle-check: once the COMMANDED trajectory reaches target, wait this
 # long, then do ONE real live-position read (not a repeating correction
 # loop - see design discussion 2026-08-13) against a WIDER tolerance
@@ -186,6 +186,12 @@ def read_ik_legs():
     rejected WHOLE, never partially executed. Rejects more than IK_LEGS_MAX
     legs, a non-numeric field, or any leg below IK_LEGS_MIN_Z - a bad list
     must not be able to drive the fingers into the board.
+
+    2026-09-29: a REJECTED list now returns None and the press does NOTHING.
+    Returning [] made the caller fall back to read_ik_target(), which for a
+    legs-only file is the built-in IK_TEST_TARGET_XYZ: a 24-leg list swung the
+    base ~68 deg the wrong way (Carla stopped it with the sticks). [] still
+    means "no legs in the file" and keeps the single-target behaviour.
     """
     try:
         with open(IK_TARGET_FILE) as f:
@@ -195,13 +201,13 @@ def read_ik_legs():
             return []
         if len(legs) > IK_LEGS_MAX:
             print("[IK] legs rejected: %d legs, max is %d" % (len(legs), IK_LEGS_MAX))
-            return []
+            return None
         out = []
         for leg in legs:
             x, y, z = float(leg["x"]), float(leg["y"]), float(leg["z"])
             if z < IK_LEGS_MIN_Z:
                 print("[IK] legs rejected: leg z=%.4f is below IK_LEGS_MIN_Z %.3f" % (z, IK_LEGS_MIN_Z))
-                return []
+                return None
             g = leg.get("grip")
             # 2026-09-26: tolerance is per leg and defaults to TIGHT. The first
             # version gave every leg but the last the LOOSE via-waypoint
@@ -213,8 +219,8 @@ def read_ik_legs():
             out.append((x, y, z, None if g is None else float(g), bool(leg.get("loose", False))))
         return out
     except Exception as e:
-        print("[IK] legs ignored (%s)" % e)
-        return []
+        print("[IK] legs rejected (%s)" % e)
+        return None
 
 
 
@@ -509,8 +515,8 @@ SHOULDER_VELOCITY_SCALING = 1.2825  # 2026-08-17: shoulder (nodes 1,2) only, a
                                      # felt violent at full extension. Base rotation
                                      # (node0) intentionally unaffected - still uses
                                      # VELOCITY_SCALING directly.
-FOREARM_VELOCITY_SCALING = 1.8   # was 2.0 - same 10% reduction
-GRIPPER_SCALING          = 0.75  # 2026-08-17: was 0.5, raised for a faster manual grip
+FOREARM_VELOCITY_SCALING = 1.944 # 2026-09-30: +8% (Carla, wrist felt slow); was 1.8, and 2.0 before that
+GRIPPER_SCALING          = 0.81  # 2026-09-30: +8% (Carla); was 0.75, and 0.5 before 2026-08-17
 
 # ------------------------------------------------------------------------------
 # 2) Joint Range Definitions
@@ -596,6 +602,7 @@ GRIPPER_RELEASE_OPEN   = 0.0       # Fully open in the NEW reference frame
                                     # frame and no longer corresponds to
                                     # anything physically meaningful.
 REST_POS_TOLERANCE     = 0.1      # radians - how close counts as "at rest_pos"
+WRIST_REST_POS_TOLERANCE = 0.2    # 2026-09-30 (Carla): arming check only, nodes 5/6 - the wrist parks just outside 0.1 (0.104 seen)
                                     # for the arming gate (proxy check only -
                                     # pos_estimate re-zeros at boot regardless
                                     # of true physical position, so this can't
@@ -613,6 +620,9 @@ REST_POS_TOLERANCE     = 0.1      # radians - how close counts as "at rest_pos"
 SAFE_RETURN_VEL_LIMIT   = 0.4
 SAFE_RETURN_ACCEL_LIMIT = 0.4
 SAFE_RETURN_DECEL_LIMIT = 0.4
+# 2026-09-30 (Carla): the GRIPPER alone returns 15% faster - 0.46 for its speed,
+# accel and decel caps. Every other joint keeps the 0.4 caps above.
+SAFE_RETURN_GRIPPER_LIMIT = 0.46
 
 # Node5/6 raw safety envelope, measured empirically from a combined
 # tilt+rotation test, plus a large safety margin. This is the
@@ -1084,9 +1094,10 @@ def run_safe_return_sequence(bus, node_ids, endpoints, shoulder_ctrl, wrist_ctrl
         accel = read_config(bus, nid, accel_ep['id'], accel_ep['type'])
         decel = read_config(bus, nid, decel_ep['id'], decel_ep['type'])
         orig_values[nid] = (vel, accel, decel)
-        vel_target   = min(vel / 2, SAFE_RETURN_VEL_LIMIT) if vel is not None else None
-        accel_target = min(accel / 2, SAFE_RETURN_ACCEL_LIMIT) if accel is not None else None
-        decel_target = min(decel / 2, SAFE_RETURN_DECEL_LIMIT) if decel is not None else None
+        g = (nid == 7)   # 2026-09-30: gripper gets its own, 15% higher caps
+        vel_target   = min(vel / 2, SAFE_RETURN_GRIPPER_LIMIT if g else SAFE_RETURN_VEL_LIMIT) if vel is not None else None
+        accel_target = min(accel / 2, SAFE_RETURN_GRIPPER_LIMIT if g else SAFE_RETURN_ACCEL_LIMIT) if accel is not None else None
+        decel_target = min(decel / 2, SAFE_RETURN_GRIPPER_LIMIT if g else SAFE_RETURN_DECEL_LIMIT) if decel is not None else None
         if vel_target is not None and not write_verified(bus, nid, vel_ep['id'], vel_ep['type'], vel_target, label="trap_vel cap"):
             failed_halve.append((nid, "vel"))
         if accel_target is not None and not write_verified(bus, nid, accel_ep['id'], accel_ep['type'], accel_target, label="trap_accel cap"):
@@ -1242,7 +1253,8 @@ def run_arming_sequence(bus, node_ids, endpoints, abort_event):
         # wasn't a stable reference across power cycles - traced to a
         # loose encoder board mount, now fixed and recalibrated
         # (2026-07-30), so it gets the same check as every other node.
-        if abs(pos - 0.0) > REST_POS_TOLERANCE:
+        tol = WRIST_REST_POS_TOLERANCE if nid in (5, 6) else REST_POS_TOLERANCE
+        if abs(pos - 0.0) > tol:
             failures.append((nid, f"not at rest_pos ({round(pos, 4)})"))
 
     if failures:
@@ -1983,6 +1995,9 @@ def joystick_thread_func(
                     # 2026-09-25: a multi-leg sequence takes precedence over via_z; one
                     # Triangle press then walks the whole list, settling between legs.
                     ik_leg_queue = read_ik_legs()
+                    ik_legs_rejected = ik_leg_queue is None
+                    if ik_legs_rejected:
+                        ik_leg_queue = []
                     ik_last_grip = None
                     via_z = None
                     if ik_leg_queue:
@@ -1999,12 +2014,17 @@ def joystick_thread_func(
                         print(f"[IK] via leg: going to ({x:.4f}, {y:.4f}, {via_z:.4f}) first, then down to z={ik_via_final_xyz[2]:.4f}")
                     else:
                         ik_via_final_xyz = None
-                    ik_request_result = {}
-                    ik_request_thread = threading.Thread(
-                        target=ik_request_worker, args=(x, y, z, ik_request_result), daemon=True
-                    )
-                    ik_request_thread.start()
-                    joystick_states["status"] = "IK MODE: requesting target..." + (" (via leg)" if ik_via_final_xyz else "")
+                    if ik_legs_rejected:
+                        ik_via_final_xyz = None
+                        joystick_states["status"] = "IK MODE: legs list REJECTED - nothing moved (see log)"
+                        print("[IK] press ignored: legs list rejected - NOT falling back to a single/test target")
+                    else:
+                        ik_request_result = {}
+                        ik_request_thread = threading.Thread(
+                            target=ik_request_worker, args=(x, y, z, ik_request_result), daemon=True
+                        )
+                        ik_request_thread.start()
+                        joystick_states["status"] = "IK MODE: requesting target..." + (" (via leg)" if ik_via_final_xyz else "")
                 ik_hold_start = None
         elif ik_request_thread is None:
             ik_hold_start = None
