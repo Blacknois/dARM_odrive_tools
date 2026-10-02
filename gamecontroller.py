@@ -623,6 +623,10 @@ SAFE_RETURN_DECEL_LIMIT = 0.4
 # 2026-09-30 (Carla): the GRIPPER alone returns 15% faster - 0.46 for its speed,
 # accel and decel caps. Every other joint keeps the 0.4 caps above.
 SAFE_RETURN_GRIPPER_LIMIT = 0.46
+# 2026-10-02 (Carla): rotations +20% - base (0), elbow roll (3) and the wrist motors
+# (5, 6; this also speeds stage 4, wrist bend, which uses the same motors).
+SAFE_RETURN_ROTATION_LIMIT = 0.48
+SAFE_RETURN_ROTATION_NODES = (0, 3, 5, 6)
 
 # Node5/6 raw safety envelope, measured empirically from a combined
 # tilt+rotation test, plus a large safety margin. This is the
@@ -1094,10 +1098,12 @@ def run_safe_return_sequence(bus, node_ids, endpoints, shoulder_ctrl, wrist_ctrl
         accel = read_config(bus, nid, accel_ep['id'], accel_ep['type'])
         decel = read_config(bus, nid, decel_ep['id'], decel_ep['type'])
         orig_values[nid] = (vel, accel, decel)
-        g = (nid == 7)   # 2026-09-30: gripper gets its own, 15% higher caps
-        vel_target   = min(vel / 2, SAFE_RETURN_GRIPPER_LIMIT if g else SAFE_RETURN_VEL_LIMIT) if vel is not None else None
-        accel_target = min(accel / 2, SAFE_RETURN_GRIPPER_LIMIT if g else SAFE_RETURN_ACCEL_LIMIT) if accel is not None else None
-        decel_target = min(decel / 2, SAFE_RETURN_GRIPPER_LIMIT if g else SAFE_RETURN_DECEL_LIMIT) if decel is not None else None
+        # 2026-09-30: gripper gets its own, 15% higher caps; 2026-10-02: rotations +20%
+        own = (SAFE_RETURN_GRIPPER_LIMIT if nid == 7 else
+               SAFE_RETURN_ROTATION_LIMIT if nid in SAFE_RETURN_ROTATION_NODES else None)
+        vel_target   = min(vel / 2, own or SAFE_RETURN_VEL_LIMIT) if vel is not None else None
+        accel_target = min(accel / 2, own or SAFE_RETURN_ACCEL_LIMIT) if accel is not None else None
+        decel_target = min(decel / 2, own or SAFE_RETURN_DECEL_LIMIT) if decel is not None else None
         if vel_target is not None and not write_verified(bus, nid, vel_ep['id'], vel_ep['type'], vel_target, label="trap_vel cap"):
             failed_halve.append((nid, "vel"))
         if accel_target is not None and not write_verified(bus, nid, accel_ep['id'], accel_ep['type'], accel_target, label="trap_accel cap"):
